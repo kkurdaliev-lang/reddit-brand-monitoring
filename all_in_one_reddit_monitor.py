@@ -46,11 +46,21 @@ CONFIG = {
     'hf_api_token': os.getenv('HF_API_TOKEN', ''),
     'brands': {
         'badinka': r'[@#]?badinka(?:\.com)?',
-        'iheartraves': r'[@#]?iheartraves(?:\.com)?'
+        'devilwalking': r'[@#]?devil\s*walking(?:\.com)?'  # Matches both "devilwalking" and "devil walking"
     },
     'monitor_all_reddit': True,  # Monitor all of Reddit, not just specific subreddits
+    'focused_subreddits': [
+        # High-priority subreddits for extra coverage
+        "Rezz", "aves", "ElectricForest", "sewing", "avesfashion",
+        "cyber_fashion", "aveoutfits", "RitaFourEssenceSystem", "SoftDramatics", "Shein",
+        "avesNYC", "veld", "BADINKA", "PlusSize",
+        "LostLandsMusicFest", "festivals", "avefashion", "avesafe", "EDCOrlando",
+        "findfashion", "BassCanyon", "Aerials", "electricdaisycarnival", "bonnaroo",
+        "Tomorrowland", "femalefashion", "Soundhaven", "warpedtour", "Shambhala",
+        "Lollapalooza", "EDM", "BeyondWonderland", "kandi"
+    ],
     'subreddits': [
-        # These are fallback/priority subreddits if needed
+        # Fallback subreddits
         "all", "popular", "announcements"
     ],
     'port': int(os.getenv('PORT', 5000))
@@ -414,7 +424,8 @@ class RedditMonitor:
         
         tasks = [
             self.monitor_rss_feeds(),
-            self.monitor_json_api()
+            self.monitor_json_api(),
+            self.monitor_focused_subreddits()  # Additional focused monitoring
         ]
         
         # Start PRAW monitoring in separate thread if available
@@ -487,6 +498,109 @@ class RedditMonitor:
                 logger.error(f"PRAW monitoring error: {e}")
                 time.sleep(30)
     
+    async def monitor_focused_subreddits(self):
+        """Monitor high-priority subreddits for extra coverage"""
+        logger.info("Starting focused subreddits monitoring...")
+        
+        while self.running:
+            try:
+                for subreddit in self.config.get('focused_subreddits', []):
+                    if not self.running:
+                        break
+                    
+                    # Monitor both posts and comments for each focused subreddit
+                    await self._monitor_subreddit_posts(subreddit)
+                    await self._monitor_subreddit_comments(subreddit)
+                    
+                    await asyncio.sleep(3)  # Delay between subreddits
+                
+                # Flush buffer if needed
+                if self.mention_buffer:
+                    await self.process_mention_buffer()
+                
+                await asyncio.sleep(120)  # Check focused subreddits every 2 minutes
+                
+            except Exception as e:
+                logger.error(f"Focused subreddits monitoring error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _monitor_subreddit_posts(self, subreddit: str):
+        """Monitor posts in a specific subreddit"""
+        try:
+            url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        await self._process_subreddit_posts(data, subreddit)
+                    elif response.status == 429:
+                        logger.warning(f"Rate limited for r/{subreddit}")
+                        await asyncio.sleep(30)
+                        
+        except Exception as e:
+            logger.error(f"Error monitoring r/{subreddit} posts: {e}")
+    
+    async def _monitor_subreddit_comments(self, subreddit: str):
+        """Monitor comments in a specific subreddit"""
+        try:
+            url = f"https://www.reddit.com/r/{subreddit}/comments.json?limit=25"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        await self._process_json_comments(data)
+                    elif response.status == 429:
+                        logger.warning(f"Rate limited for r/{subreddit}")
+                        await asyncio.sleep(30)
+                        
+        except Exception as e:
+            logger.error(f"Error monitoring r/{subreddit} comments: {e}")
+    
+    async def _process_subreddit_posts(self, data: dict, subreddit: str):
+        """Process posts from focused subreddit monitoring"""
+        try:
+            if 'data' in data and 'children' in data['data']:
+                for item in data['data']['children']:
+                    if not self.running:
+                        break
+                    
+                    post_data = item['data']
+                    post_id = post_data.get('id')
+                    
+                    if post_id in self.seen_ids:
+                        continue
+                    
+                    title = post_data.get('title', '')
+                    selftext = post_data.get('selftext', '')
+                    full_text = f"{title} {selftext}"
+                    
+                    brands = self.find_brands(full_text)
+                    if brands:
+                        for brand in brands:
+                            mention = Mention(
+                                id=post_id,
+                                type="post",
+                                title=title,
+                                body=selftext,
+                                permalink=f"https://reddit.com{post_data.get('permalink', '')}",
+                                created=datetime.fromtimestamp(post_data.get('created_utc', 0), tz=timezone.utc).isoformat(),
+                                subreddit=subreddit,
+                                author=post_data.get('author', 'unknown'),
+                                score=post_data.get('score', 0),
+                                sentiment=None,
+                                brand=brand,
+                                source="focused_subreddit"
+                            )
+                            
+                            self.mention_buffer.append(mention)
+                            self.seen_ids.add(post_id)
+                            logger.info(f"Found focused mention: {brand} in r/{subreddit} (post)")
+                            
+        except Exception as e:
+            logger.error(f"Focused subreddit posts processing error: {e}")
+
     def stop_monitoring(self):
         """Stop monitoring"""
         self.running = False
@@ -860,11 +974,11 @@ HTML_TEMPLATE = '''
 </head>
 <body>
   <h1>Reddit Brand Monitoring - ALL OF REDDIT 🌍</h1>
-  <div id="brand-buttons">
-    <button id="btn-badinka" onclick="switchBrand('badinka')">My Brand</button>
-    <button id="btn-iheartraves" onclick="switchBrand('iheartraves')">My Competitor</button>
-    <button id="btn-stats" onclick="showStats()">Stats</button>
-  </div>
+     <div id="brand-buttons">
+     <button id="btn-badinka" onclick="switchBrand('badinka')">Badinka</button>
+     <button id="btn-devilwalking" onclick="switchBrand('devilwalking')">Devil Walking</button>
+     <button id="btn-stats" onclick="showStats()">Stats</button>
+   </div>
   <p class="csv-btn">
     <button id="csv-btn" onclick="window.location.href='/download'">📥 Download CSV</button>
     <button id="pdf-btn" style="display:none;" onclick="downloadPDF()">📄 Download as PDF</button>
@@ -926,28 +1040,28 @@ HTML_TEMPLATE = '''
     let barCharts = { left: null, right: null };
     let weekOffset = 0;
 
-    function switchBrand(brand) {
-      currentBrand = brand;
-      document.getElementById("mentions-tab").style.display = "block";
-      document.getElementById("stats-tab").style.display = "none";
-      document.getElementById("btn-badinka").disabled = (brand === "badinka");
-      document.getElementById("btn-iheartraves").disabled = (brand === "iheartraves");
-      document.getElementById("btn-stats").disabled = false;
-      document.getElementById("csv-btn").style.display = 'inline-block';
-      document.getElementById("pdf-btn").style.display = 'none';
-      loadData();
-    }
+         function switchBrand(brand) {
+       currentBrand = brand;
+       document.getElementById("mentions-tab").style.display = "block";
+       document.getElementById("stats-tab").style.display = "none";
+       document.getElementById("btn-badinka").disabled = (brand === "badinka");
+       document.getElementById("btn-devilwalking").disabled = (brand === "devilwalking");
+       document.getElementById("btn-stats").disabled = false;
+       document.getElementById("csv-btn").style.display = 'inline-block';
+       document.getElementById("pdf-btn").style.display = 'none';
+       loadData();
+     }
 
-    function showStats() {
-      document.getElementById("mentions-tab").style.display = "none";
-      document.getElementById("stats-tab").style.display = "block";
-      document.getElementById("btn-badinka").disabled = false;
-      document.getElementById("btn-iheartraves").disabled = false;
-      document.getElementById("btn-stats").disabled = true;
-      document.getElementById("csv-btn").style.display = 'none';
-      document.getElementById("pdf-btn").style.display = 'inline-block';
-      loadStats();
-    }
+         function showStats() {
+       document.getElementById("mentions-tab").style.display = "none";
+       document.getElementById("stats-tab").style.display = "block";
+       document.getElementById("btn-badinka").disabled = false;
+       document.getElementById("btn-devilwalking").disabled = false;
+       document.getElementById("btn-stats").disabled = true;
+       document.getElementById("csv-btn").style.display = 'none';
+       document.getElementById("pdf-btn").style.display = 'inline-block';
+       loadStats();
+     }
 
     function changeWeek(offset) {
       weekOffset += offset;
@@ -1004,12 +1118,12 @@ HTML_TEMPLATE = '''
       }).then(() => loadData());
     }
 
-    function loadStats() {
-      const tzOffset = new Date().getTimezoneOffset();
-      fetch(`/stats?brand=badinka&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
-      fetch(`/stats?brand=iheartraves&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
-      loadWeeklyCharts();
-    }
+         function loadStats() {
+       const tzOffset = new Date().getTimezoneOffset();
+       fetch(`/stats?brand=badinka&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
+       fetch(`/stats?brand=devilwalking&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
+       loadWeeklyCharts();
+     }
 
     function renderStats(data, side) {
       const totalToday = data.daily.posts + data.daily.comments;
@@ -1061,10 +1175,10 @@ HTML_TEMPLATE = '''
       const labels = days.map(d => d.toLocaleDateString());
       const keys = days.map(d => d.toLocaleDateString('en-CA'));  // en-CA = YYYY-MM-DD
 
-      Promise.all([
-        fetch(`/weekly_mentions?brand=badinka&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
-        fetch(`/weekly_mentions?brand=iheartraves&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
-      ]).then(([leftData, rightData]) => {
+             Promise.all([
+         fetch(`/weekly_mentions?brand=badinka&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
+         fetch(`/weekly_mentions?brand=devilwalking&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
+       ]).then(([leftData, rightData]) => {
         const leftValues = keys.map(key => leftData[key] || 0);
         const rightValues = keys.map(key => rightData[key] || 0);
         const maxY = Math.max(...leftValues, ...rightValues, 1);
@@ -1132,6 +1246,9 @@ def main():
     reddit_monitor = RedditMonitor(CONFIG, db_manager)
     if CONFIG.get('monitor_all_reddit', False):
         print("✅ Reddit monitor initialized - MONITORING ALL OF REDDIT 🌍")
+        focused_count = len(CONFIG.get('focused_subreddits', []))
+        print(f"✅ + Focused monitoring: {focused_count} priority subreddits")
+        print(f"✅ Brands: {', '.join(CONFIG['brands'].keys())}")
     else:
         print("✅ Reddit monitor initialized - monitoring specific subreddits")
     
