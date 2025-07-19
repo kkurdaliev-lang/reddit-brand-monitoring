@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 CONFIG = {
-    'database_file': 'reddit_monitor.db',
+    'database_file': '/app/data/reddit_monitor.db' if os.path.exists('/app/data') else 'reddit_monitor.db',
     'reddit': {
         'client_id': os.getenv('REDDIT_CLIENT_ID', ''),
         'client_secret': os.getenv('REDDIT_CLIENT_SECRET', ''),
@@ -1377,9 +1377,24 @@ def main():
     
     print("🚀 Starting All-in-One Reddit Brand Monitor...")
     
+    # Ensure data directory exists for persistent storage
+    data_dir = '/app/data'
+    if not os.path.exists(data_dir):
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            print(f"📁 Created data directory: {data_dir}")
+        except Exception as e:
+            print(f"⚠️ Could not create data directory: {e}")
+    
     # Initialize database
     db_manager = DatabaseManager(CONFIG['database_file'])
     print(f"✅ Database initialized: {CONFIG['database_file']}")
+    
+    # Log storage info
+    if os.path.exists('/app/data'):
+        print("💾 Using persistent storage - data will survive redeploys!")
+    else:
+        print("⚠️ Using temporary storage - data will be lost on redeploy")
     
     # Initialize Reddit monitor
     reddit_monitor = RedditMonitor(CONFIG, db_manager)

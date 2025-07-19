@@ -5,3 +5,8 @@ builder = "nixpacks"
 healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "on_failure"
+
+# Add persistent volume for database
+[[deploy.volumes]]
+mountPath = "/app/data"
+name = "reddit_monitor_data"
