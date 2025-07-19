@@ -47,9 +47,10 @@ CONFIG = {
         'badinka': r'[@#]?badinka(?:\.com)?',
         'iheartraves': r'[@#]?iheartraves(?:\.com)?'
     },
+    'monitor_all_reddit': True,  # Monitor all of Reddit, not just specific subreddits
     'subreddits': [
-        "aves", "ElectricForest", "festivals", "EDM", "electricdaisycarnival",
-        "sewing", "fashion", "findfashion", "Shein", "PlusSize"
+        # These are fallback/priority subreddits if needed
+        "all", "popular", "announcements"
     ],
     'port': int(os.getenv('PORT', 5000))
 }
@@ -247,7 +248,13 @@ class RedditMonitor:
         
         while self.running:
             try:
-                for subreddit in self.config['subreddits']:
+                # Monitor all Reddit posts or specific subreddits
+                if self.config.get('monitor_all_reddit', False):
+                    subreddits_to_monitor = ["all", "popular"]
+                else:
+                    subreddits_to_monitor = self.config['subreddits']
+                
+                for subreddit in subreddits_to_monitor:
                     if not self.running:
                         break
                     
@@ -320,13 +327,10 @@ class RedditMonitor:
         
         while self.running:
             try:
-                # Monitor specific subreddits
-                for subreddit_chunk in self._chunk_subreddits():
-                    if not self.running:
-                        break
-                    
-                    chunk_str = "+".join(subreddit_chunk)
-                    url = f"https://www.reddit.com/r/{chunk_str}/comments.json?limit=25"
+                # Monitor all Reddit or specific subreddits
+                if self.config.get('monitor_all_reddit', False):
+                    # Monitor all Reddit comments
+                    url = "https://www.reddit.com/r/all/comments.json?limit=100"
                     
                     try:
                         async with aiohttp.ClientSession() as session:
@@ -338,9 +342,31 @@ class RedditMonitor:
                                     logger.warning("JSON API rate limited")
                                     await asyncio.sleep(60)
                     except Exception as e:
-                        logger.error(f"JSON API error for {chunk_str}: {e}")
+                        logger.error(f"JSON API error for r/all: {e}")
                     
-                    await asyncio.sleep(5)  # Delay between chunks
+                    await asyncio.sleep(10)  # Slightly longer delay for r/all
+                else:
+                    # Monitor specific subreddits (original behavior)
+                    for subreddit_chunk in self._chunk_subreddits():
+                        if not self.running:
+                            break
+                        
+                        chunk_str = "+".join(subreddit_chunk)
+                        url = f"https://www.reddit.com/r/{chunk_str}/comments.json?limit=25"
+                        
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                                    if response.status == 200:
+                                        data = await response.json()
+                                        await self._process_json_comments(data)
+                                    elif response.status == 429:
+                                        logger.warning("JSON API rate limited")
+                                        await asyncio.sleep(60)
+                        except Exception as e:
+                            logger.error(f"JSON API error for {chunk_str}: {e}")
+                        
+                        await asyncio.sleep(5)  # Delay between chunks
                 
                 # Flush buffer if needed
                 if self.mention_buffer:
@@ -421,8 +447,12 @@ class RedditMonitor:
         
         while self.running:
             try:
-                subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
-                comment_stream = subreddit.stream.comments(skip_existing=True, pause_after=10)
+                # Monitor all Reddit comments
+                if self.config.get('monitor_all_reddit', False):
+                    subreddit = self.reddit.subreddit("all")
+                else:
+                    subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
+                comment_stream = subreddit.stream.comments(skip_existing=True, pause_after=5)
                 
                 for comment in comment_stream:
                     if not self.running:
@@ -1200,7 +1230,10 @@ def main():
     
     # Initialize Reddit monitor
     reddit_monitor = RedditMonitor(CONFIG, db_manager)
-    print("✅ Reddit monitor initialized")
+    if CONFIG.get('monitor_all_reddit', False):
+        print("✅ Reddit monitor initialized - MONITORING ALL OF REDDIT 🌍")
+    else:
+        print("✅ Reddit monitor initialized - monitoring specific subreddits")
     
     # Start monitoring in background thread
     monitoring_thread = threading.Thread(target=run_monitoring_thread, daemon=True)
