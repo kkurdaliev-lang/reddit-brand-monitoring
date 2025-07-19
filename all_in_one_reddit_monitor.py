@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 CONFIG = {
-    'database_file': '/app/data/reddit_monitor.db' if os.path.exists('/app/data') else 'reddit_monitor.db',
+    'database_file': '/app/data/reddit_monitor.db',
     'reddit': {
         'client_id': os.getenv('REDDIT_CLIENT_ID', ''),
         'client_secret': os.getenv('REDDIT_CLIENT_SECRET', ''),

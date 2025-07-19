@@ -6,7 +6,7 @@ healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "on_failure"
 
-# Add persistent volume for database
+# Add persistent volume for database storage
 [[deploy.volumes]]
 mountPath = "/app/data"
-name = "reddit_monitor_data"
+name = "reddit-monitor-data"
