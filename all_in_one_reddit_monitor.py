@@ -549,9 +549,9 @@ class RedditMonitor:
                     
                     # Flush buffer periodically
                     if len(self.mention_buffer) >= 10:
-                        # Process buffer synchronously for thread safety
+                        # Process buffer with sentiment analysis
                         if self.mention_buffer:
-                            self.db.insert_mentions(self.mention_buffer)
+                            self._process_praw_buffer_with_sentiment()
                             self.mention_buffer.clear()
                 
             except prawcore.exceptions.TooManyRequests:
@@ -622,18 +622,42 @@ class RedditMonitor:
                     
                     # Flush buffer periodically
                     if len(self.mention_buffer) >= 10:
-                        # Process buffer synchronously for thread safety
+                        # Process buffer with sentiment analysis
                         if self.mention_buffer:
-                            self.db.insert_mentions(self.mention_buffer)
+                            self._process_praw_buffer_with_sentiment()
                             self.mention_buffer.clear()
                 
             except prawcore.exceptions.TooManyRequests:
                 logger.warning("PRAW posts rate limited, sleeping 60 seconds")
                 time.sleep(60)
             except Exception as e:
-                logger.error(f"PRAW post monitoring error: {e}")
+                                logger.error(f"PRAW post monitoring error: {e}")
                 time.sleep(30)
     
+    def _process_praw_buffer_with_sentiment(self):
+        """Process PRAW mention buffer with sentiment analysis (synchronous)"""
+        if not self.mention_buffer:
+            return
+        
+        # Add sentiment analysis for each mention
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            for mention in self.mention_buffer:
+                if mention.sentiment is None:
+                    text = f"{mention.title or ''} {mention.body or ''}"
+                    # Run sentiment analysis synchronously
+                    mention.sentiment = loop.run_until_complete(self.sentiment.analyze(text))
+            
+            # Save to database
+            self.db.insert_mentions(self.mention_buffer)
+            logger.info(f"💭 Processed {len(self.mention_buffer)} mentions with sentiment analysis")
+        
+        finally:
+            loop.close()
+     
     async def monitor_focused_subreddits(self):
         """Monitor high-priority subreddits for extra coverage"""
         logger.info("Starting focused subreddits monitoring...")
