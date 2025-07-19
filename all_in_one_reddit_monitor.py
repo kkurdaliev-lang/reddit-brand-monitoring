@@ -475,11 +475,26 @@ class RedditMonitor:
         await asyncio.gather(*tasks, return_exceptions=True)
     
     def _monitor_praw_sync(self):
-        """Monitor comments using PRAW in sync mode (separate thread)"""
+        """Monitor comments and posts using PRAW in sync mode (separate thread)"""
         if not self.reddit:
             return
         
         logger.info("Starting PRAW monitoring...")
+        
+        # Start both comment and post monitoring in separate threads
+        comment_thread = threading.Thread(target=self._monitor_praw_comments, daemon=True)
+        post_thread = threading.Thread(target=self._monitor_praw_posts, daemon=True)
+        
+        comment_thread.start()
+        post_thread.start()
+        
+        # Wait for threads to complete
+        comment_thread.join()
+        post_thread.join()
+    
+    def _monitor_praw_comments(self):
+        """Monitor comments using PRAW"""
+        logger.info("Starting PRAW comment monitoring...")
         
         while self.running:
             try:
@@ -543,7 +558,80 @@ class RedditMonitor:
                 logger.warning("PRAW rate limited, sleeping 60 seconds")
                 time.sleep(60)
             except Exception as e:
-                logger.error(f"PRAW monitoring error: {e}")
+                logger.error(f"PRAW comment monitoring error: {e}")
+                time.sleep(30)
+    
+    def _monitor_praw_posts(self):
+        """Monitor posts using PRAW"""
+        logger.info("Starting PRAW post monitoring...")
+        
+        while self.running:
+            try:
+                # Monitor all Reddit posts
+                if self.config.get('monitor_all_reddit', False):
+                    subreddit = self.reddit.subreddit("all")
+                else:
+                    subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
+                
+                post_stream = subreddit.stream.submissions(skip_existing=True, pause_after=5)
+                
+                for post in post_stream:
+                    if not self.running:
+                        break
+                    
+                    if post is None:
+                        time.sleep(1)
+                        continue
+                    
+                    if post.id in self.seen_ids:
+                        continue
+                    
+                    # Debug: Log every 50th post to see what we're processing
+                    if hasattr(self, '_post_count'):
+                        self._post_count += 1
+                    else:
+                        self._post_count = 1
+                    
+                    if self._post_count % 50 == 0:
+                        logger.info(f"📝 Processed {self._post_count} posts, checking: '{post.title[:50]}...'")
+                    
+                    # Check both title and selftext for brand mentions
+                    full_text = f"{post.title} {post.selftext}"
+                    brands = self.find_brands(full_text)
+                    
+                    if brands:
+                        for brand in brands:
+                            mention = Mention(
+                                id=post.id,
+                                type="post",
+                                title=post.title,
+                                body=post.selftext,
+                                permalink=f"https://reddit.com{post.permalink}",
+                                created=datetime.fromtimestamp(post.created_utc, tz=timezone.utc).isoformat(),
+                                subreddit=str(post.subreddit),
+                                author=str(post.author),
+                                score=post.score,
+                                sentiment=None,
+                                brand=brand,
+                                source="praw"
+                            )
+                            
+                            self.mention_buffer.append(mention)
+                            self.seen_ids.add(post.id)
+                            logger.info(f"🎉 Found PRAW post mention: {brand} in r/{post.subreddit}")
+                    
+                    # Flush buffer periodically
+                    if len(self.mention_buffer) >= 10:
+                        # Process buffer synchronously for thread safety
+                        if self.mention_buffer:
+                            self.db.insert_mentions(self.mention_buffer)
+                            self.mention_buffer.clear()
+                
+            except prawcore.exceptions.TooManyRequests:
+                logger.warning("PRAW posts rate limited, sleeping 60 seconds")
+                time.sleep(60)
+            except Exception as e:
+                logger.error(f"PRAW post monitoring error: {e}")
                 time.sleep(30)
     
     async def monitor_focused_subreddits(self):
@@ -559,6 +647,9 @@ class RedditMonitor:
                     # Monitor both posts and comments for each focused subreddit
                     await self._monitor_subreddit_posts(subreddit)
                     await self._monitor_subreddit_comments(subreddit)
+                    
+                    # Small delay between monitoring different content types
+                    await asyncio.sleep(1)
                     
                     await asyncio.sleep(3)  # Delay between subreddits
                 
