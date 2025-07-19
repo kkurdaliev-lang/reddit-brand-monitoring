@@ -47,7 +47,10 @@ CONFIG = {
     'hf_api_token': os.getenv('HF_API_TOKEN', ''),
     'brands': {
         'badinka': r'[@#]?badinka(?:\.com)?',
-        'devilwalking': r'[@#]?devil\s*walking(?:\.com)?'  # Matches both "devilwalking" and "devil walking"
+        'devilwalking': r'[@#]?devil\s*walking(?:\.com)?',  # Matches both "devilwalking" and "devil walking"
+        # Add more brands here if needed:
+        # 'rave_fashion': r'[@#]?rave\s*fashion',
+        # 'festival_outfit': r'[@#]?festival\s*outfit',
     },
     'monitor_all_reddit': True,  # Monitor all of Reddit, not just specific subreddits
     'focused_subreddits': [
