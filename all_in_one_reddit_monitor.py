@@ -684,6 +684,22 @@ class RedditMonitor:
         finally:
             loop.close()
     
+    def _extract_simple_context(self, text, brand_name):
+        """Simple context extraction for JSON monitoring"""
+        text_lower = text.lower()
+        brand_lower = brand_name.lower()
+        
+        # Find brand position
+        pos = text_lower.find(brand_lower)
+        if pos == -1:
+            return text[:200]  # Return first 200 chars if brand not found
+        
+        # Extract 100 chars before and after the brand
+        start = max(0, pos - 100)
+        end = min(len(text), pos + len(brand_lower) + 100)
+        
+        return text[start:end].strip()
+    
     def _extract_brand_context(self, mention):
         """Extract context around brand mention for focused sentiment analysis"""
         full_text = f"{mention.title or ''} {mention.body or ''}".lower()
@@ -823,8 +839,8 @@ class RedditMonitor:
                             # Check for brand mentions
                             for brand_name, brand_pattern in self.brands.items():
                                 if brand_pattern.search(body):
-                                    # Extract context around the mention
-                                    context = self._extract_context(body, brand_name)
+                                    # Extract context around the mention (simple version for JSON)
+                                    context = self._extract_simple_context(body, brand_name)
                                     
                                     # Add to mention buffer for sentiment analysis
                                     mention_data = {
