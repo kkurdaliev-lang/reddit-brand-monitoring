@@ -686,7 +686,8 @@ class RedditMonitor:
                     author=mention_dict.get('author', 'unknown'),
                     score=mention_dict.get('score', 0),
                     sentiment=sentiment,
-                    brand=mention_dict['brand']
+                    brand=mention_dict['brand'],
+                    source="json_chunked_monitoring"
                 )
                 
                 self.db.insert_mentions([mention_obj])
