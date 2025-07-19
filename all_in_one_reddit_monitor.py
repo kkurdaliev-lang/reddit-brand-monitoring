@@ -645,7 +645,7 @@ class RedditMonitor:
                 logger.warning("PRAW posts rate limited, sleeping 60 seconds")
                 time.sleep(60)
             except Exception as e:
-                                logger.error(f"PRAW post monitoring error: {e}")
+                logger.error(f"PRAW post monitoring error: {e}")
                 time.sleep(30)
     
     def _process_praw_buffer_with_sentiment(self):
