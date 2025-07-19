@@ -1477,7 +1477,7 @@ def main():
     try:
         # Start with just Flask to ensure basic functionality
         print("🔄 Starting Flask server first...")
-        port = CONFIG['port']
+        port = int(os.getenv('PORT', CONFIG['port']))  # CRITICAL: Use Railway's PORT
         print(f"🌐 Web interface will start on port {port}")
         
         # Initialize minimal components
@@ -1529,8 +1529,8 @@ def main():
         traceback.print_exc()
         # Try to start Flask anyway with minimal functionality
         try:
-            print("🚨 Attempting emergency Flask start...")
-            app.run(host='0.0.0.0', port=CONFIG['port'], debug=False)
+            print(f"🚨 Attempting emergency Flask start on port {port}...")
+            app.run(host='0.0.0.0', port=port, debug=False)
         except:
             print("💥 Emergency Flask start also failed")
             raise
