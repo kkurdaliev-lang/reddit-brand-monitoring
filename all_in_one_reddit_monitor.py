@@ -168,11 +168,19 @@ class SentimentAnalyzer:
     def __init__(self, api_token: str):
         self.api_token = api_token
         self.api_url = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
+        logger.info(f"🤖 Sentiment analyzer initialized with URL: {self.api_url}")
         self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
     
     async def analyze(self, context_text: str) -> str:
         """Analyze sentiment of brand-focused context text"""
-        if not self.api_token or not context_text.strip():
+        logger.info(f"🔍 Starting sentiment analysis for text: '{context_text[:100]}...'")
+        
+        if not self.api_token:
+            logger.warning("❌ No HuggingFace API token provided")
+            return "neutral"
+            
+        if not context_text.strip():
+            logger.warning("❌ Empty text provided for sentiment analysis")
             return "neutral"
         
         try:
@@ -181,14 +189,26 @@ class SentimentAnalyzer:
                 focused_text = context_text[:400]  # Slightly shorter for better focus
                 payload = {"inputs": focused_text}
                 
+                logger.info(f"📡 Sending request to: {self.api_url}")
+                logger.info(f"📦 Payload: {payload}")
+                logger.info(f"🔑 Headers: {self.headers}")
+                
                 async with session.post(self.api_url, headers=self.headers, json=payload) as response:
+                    logger.info(f"📊 Response status: {response.status}")
+                    response_text = await response.text()
+                    logger.info(f"📄 Response body: {response_text}")
+                    
                     if response.status == 200:
                         result = await response.json()
+                        logger.info(f"✅ Parsed JSON result: {result}")
+                        
                         if result and isinstance(result, list) and result[0]:
                             scores = result[0]
                             best_score = max(scores, key=lambda x: x['score'])
                             label = best_score['label'].lower()
                             confidence = best_score['score']
+                            
+                            logger.info(f"🏆 Best score: {best_score}")
                             
                             # Map labels to our sentiment system
                             if 'positive' in label:
@@ -198,13 +218,16 @@ class SentimentAnalyzer:
                             else:
                                 sentiment = 'neutral'
                             
-                            logger.debug(f"🎯 Sentiment: {sentiment} (confidence: {confidence:.2f})")
+                            logger.info(f"🎯 Final sentiment: {sentiment} (confidence: {confidence:.2f})")
                             return sentiment
                     else:
-                        logger.warning(f"HuggingFace API returned status {response.status}")
+                        logger.error(f"❌ HuggingFace API returned status {response.status}: {response_text}")
         except Exception as e:
-            logger.error(f"Sentiment analysis error: {e}")
+            logger.error(f"💥 Sentiment analysis error: {e}")
+            import traceback
+            logger.error(f"📚 Traceback: {traceback.format_exc()}")
         
+        logger.warning("⚠️ Falling back to neutral sentiment")
         return "neutral"
 
 class RedditMonitor:
@@ -589,7 +612,7 @@ class RedditMonitor:
                                 loop.close()
                             
                             mention = Mention(
-                                id=comment.id,
+                                id=comment.id,  # Use actual Reddit comment ID (e.g., n3z93h6)
                                 type="comment",
                                 title=None,
                                 body=comment.body,
@@ -689,7 +712,7 @@ class RedditMonitor:
                                 loop.close()
                             
                             mention = Mention(
-                                id=post.id,
+                                id=post.id,  # Use actual Reddit post ID
                                 type="post",
                                 title=post.title,
                                 body=post.selftext,
@@ -970,9 +993,12 @@ class RedditMonitor:
                                     finally:
                                         loop.close()
                                     
-                                    # Create stable ID based on Reddit comment ID
-                                    reddit_id = c.get('id', f"unknown_{int(c.get('created_utc', time.time()))}")
-                                    mention_id = f"json_{reddit_id}_{brand_name}"
+                                    # Use actual Reddit comment ID (e.g., n3z93h6)
+                                    reddit_id = c.get('id')
+                                    if not reddit_id:
+                                        logger.warning("❌ No Reddit ID found in JSON data")
+                                        continue
+                                    mention_id = reddit_id  # Use actual Reddit ID directly
                                     
                                     # Check for duplicates using both ID and content  
                                     content_hash = f"{brand_name}_{c.get('subreddit', 'unknown')}_{hash(body[:100])}"
