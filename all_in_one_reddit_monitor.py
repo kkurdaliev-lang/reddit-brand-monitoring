@@ -12,6 +12,7 @@ All-in-One Reddit Brand Monitor
 import asyncio
 import aiohttp
 import sqlite3
+import sys
 import praw
 import prawcore
 import requests
@@ -1474,6 +1475,14 @@ def main():
     print(f"🔧 PORT environment variable: {os.getenv('PORT', 'Not set')}")
     
     try:
+        # Start with just Flask to ensure basic functionality
+        print("🔄 Starting Flask server first...")
+        port = CONFIG['port']
+        print(f"🌐 Web interface will start on port {port}")
+        
+        # Initialize minimal components
+        print("🔄 Initializing database...")
+        
         # Ensure data directory exists for persistent storage
         data_dir = '/app/data'
         if not os.path.exists(data_dir):
@@ -1484,47 +1493,47 @@ def main():
                 print(f"⚠️ Could not create data directory: {e}")
         
         # Initialize database
-        print("🔄 Initializing database...")
         db_manager = DatabaseManager(CONFIG['database_file'])
         print(f"✅ Database initialized: {CONFIG['database_file']}")
         
-        # Log storage info
-        if os.path.exists('/app/data'):
-            print("💾 Using persistent storage - data will survive redeploys!")
-        else:
-            print("⚠️ Using temporary storage - data will be lost on redeploy")
-        
-        # Initialize Reddit monitor
+        # Initialize Reddit monitor but don't start monitoring yet
         print("🔄 Initializing Reddit monitor...")
         reddit_monitor = RedditMonitor(CONFIG, db_manager)
-        if CONFIG.get('monitor_all_reddit', False):
-            print("✅ Reddit monitor initialized - MONITORING ALL OF REDDIT 🌍")
-            focused_count = len(CONFIG.get('focused_subreddits', []))
-            print(f"✅ + Focused monitoring: {focused_count} priority subreddits")
-            print(f"✅ Brands: {', '.join(CONFIG['brands'].keys())}")
-        else:
-            print("✅ Reddit monitor initialized - monitoring specific subreddits")
+        print("✅ Reddit monitor initialized (monitoring will start after Flask)")
         
-        # Start monitoring in background thread
-        print("🔄 Starting background monitoring...")
-        monitoring_thread = threading.Thread(target=run_monitoring_thread, daemon=True)
+        # Start Flask first, then monitoring
+        print("✅ Starting Flask server...")
+        
+        # Start monitoring in background after a delay
+        def delayed_monitoring_start():
+            import time
+            time.sleep(10)  # Wait 10 seconds for Flask to fully start
+            try:
+                print("🔄 Starting background monitoring...")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(reddit_monitor.start_monitoring())
+            except Exception as e:
+                print(f"⚠️ Background monitoring failed to start: {e}")
+        
+        monitoring_thread = threading.Thread(target=delayed_monitoring_start, daemon=True)
         monitoring_thread.start()
-        print("✅ Background monitoring started")
         
-        # Start Flask web interface
-        print(f"🌐 Starting web interface on port {CONFIG['port']}")
-        print(f"📊 Dashboard: http://localhost:{CONFIG['port']}")
-        print(f"🔍 Health check: http://localhost:{CONFIG['port']}/health")
-        print("✅ Flask app starting...")
-        
-        # Make sure Flask starts properly
-        app.run(host='0.0.0.0', port=CONFIG['port'], debug=False, threaded=True)
+        # Start Flask - this should work since our test worked
+        print(f"🔍 Health check: http://localhost:{port}/health")
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
         
     except Exception as e:
         print(f"❌ Critical error during startup: {e}")
         import traceback
         traceback.print_exc()
-        raise
+        # Try to start Flask anyway with minimal functionality
+        try:
+            print("🚨 Attempting emergency Flask start...")
+            app.run(host='0.0.0.0', port=CONFIG['port'], debug=False)
+        except:
+            print("💥 Emergency Flask start also failed")
+            raise
     except KeyboardInterrupt:
         print("\n⏹️  Shutting down...")
         if 'reddit_monitor' in globals():

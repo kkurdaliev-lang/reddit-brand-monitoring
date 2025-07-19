@@ -1,1 +1,1 @@
-web: python test_railway.py
+web: python all_in_one_reddit_monitor.py
