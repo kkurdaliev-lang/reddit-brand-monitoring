@@ -151,11 +151,23 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.execute("SELECT id FROM mentions")
             return set(row[0] for row in cursor.fetchall())
+    
+    def get_existing_content_hashes(self) -> Set[str]:
+        """Get set of content hashes to detect duplicates by content"""
+        with self.get_connection() as conn:
+            cursor = conn.execute("SELECT body, brand, subreddit FROM mentions")
+            hashes = set()
+            for row in cursor.fetchall():
+                body, brand, subreddit = row
+                # Create a content-based hash for duplicate detection
+                content_hash = f"{brand}_{subreddit}_{hash(body[:100])}"
+                hashes.add(content_hash)
+            return hashes
 
 class SentimentAnalyzer:
     def __init__(self, api_token: str):
         self.api_token = api_token
-        self.api_url = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment"
+        self.api_url = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
         self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
     
     async def analyze(self, context_text: str) -> str:
@@ -205,9 +217,11 @@ class RedditMonitor:
         }
         self.sentiment = SentimentAnalyzer(config['hf_api_token'])
         self.seen_ids = self.db.get_existing_ids()
+        self.seen_content = self.db.get_existing_content_hashes()
         logger.info(f"🔍 Loaded {len(self.seen_ids)} existing IDs to prevent duplicates")
+        logger.info(f"🔍 Loaded {len(self.seen_content)} existing content hashes to prevent duplicates")
         if self.seen_ids:
-            logger.info(f"🔍 Sample existing IDs: {list(self.seen_ids)[:5]}")  # Show first 5 IDs
+            logger.info(f"🔍 Sample existing IDs: {list(self.seen_ids)[:3]}")  # Show first 3 IDs
         self.mention_buffer: List[Mention] = []  # For PRAW mention objects
         self.json_mention_buffer = []  # For JSON mention dictionaries
         self.running = False
@@ -589,14 +603,17 @@ class RedditMonitor:
                                 source="praw"
                             )
                             
-                            # Check for duplicates before saving
-                            if comment.id not in self.seen_ids:
+                            # Check for duplicates using both ID and content
+                            content_hash = f"{brand}_{str(comment.subreddit)}_{hash(comment.body[:100])}"
+                            
+                            if comment.id not in self.seen_ids and content_hash not in self.seen_content:
                                 # Save to database IMMEDIATELY
                                 self.db.insert_mentions([mention])
                                 self.seen_ids.add(comment.id)
+                                self.seen_content.add(content_hash)
                                 logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment} (ID: {comment.id})")
                             else:
-                                logger.info(f"⏭️ Skipped duplicate comment {comment.id} for brand {brand}")
+                                logger.info(f"⏭️ Skipped duplicate: ID={comment.id in self.seen_ids}, Content={content_hash in self.seen_content} for brand {brand}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -686,14 +703,17 @@ class RedditMonitor:
                                 source="praw"
                             )
                             
-                            # Check for duplicates before saving
-                            if post.id not in self.seen_ids:
+                            # Check for duplicates using both ID and content
+                            content_hash = f"{brand}_{str(post.subreddit)}_{hash(full_text[:100])}"
+                            
+                            if post.id not in self.seen_ids and content_hash not in self.seen_content:
                                 # Save to database IMMEDIATELY
                                 self.db.insert_mentions([mention])
                                 self.seen_ids.add(post.id)
+                                self.seen_content.add(content_hash)
                                 logger.info(f"✅ Saved PRAW post mention: {brand} in r/{post.subreddit} with sentiment: {sentiment}")
                             else:
-                                logger.debug(f"⏭️ Skipped duplicate post {post.id}")
+                                logger.info(f"⏭️ Skipped duplicate post: ID={post.id in self.seen_ids}, Content={content_hash in self.seen_content} for brand {brand}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -954,9 +974,11 @@ class RedditMonitor:
                                     reddit_id = c.get('id', f"unknown_{int(c.get('created_utc', time.time()))}")
                                     mention_id = f"json_{reddit_id}_{brand_name}"
                                     
-                                    # Check for duplicates before processing
-                                    if mention_id in self.seen_ids:
-                                        logger.debug(f"⏭️ Skipped duplicate JSON mention {mention_id}")
+                                    # Check for duplicates using both ID and content  
+                                    content_hash = f"{brand_name}_{c.get('subreddit', 'unknown')}_{hash(body[:100])}"
+                                    
+                                    if mention_id in self.seen_ids or content_hash in self.seen_content:
+                                        logger.debug(f"⏭️ Skipped duplicate JSON mention: ID={mention_id in self.seen_ids}, Content={content_hash in self.seen_content}")
                                         continue
                                     
                                     # Create Mention object and save IMMEDIATELY
@@ -978,6 +1000,7 @@ class RedditMonitor:
                                     # Save to database IMMEDIATELY
                                     self.db.insert_mentions([mention_obj])
                                     self.seen_ids.add(mention_id)  # Add to seen_ids to prevent duplicates
+                                    self.seen_content.add(content_hash)  # Add to seen_content to prevent duplicates
                                     seen_json_ids.add(cid)
                                     logger.info(f"✅ Saved JSON mention: {brand_name} in r/{c.get('subreddit')} with sentiment: {sentiment}")
                     
