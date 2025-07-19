@@ -876,9 +876,21 @@ class RedditMonitor:
                     
                     time.sleep(base_delay)
                     
+                    # Process mention buffer periodically
+                    if self.mention_buffer:
+                        logger.info(f"💾 Processing {len(self.mention_buffer)} mentions from buffer...")
+                        self._process_praw_buffer_with_sentiment()
+                        self.mention_buffer.clear()
+                    
             except Exception as e:
                 logger.error(f"JSON comment monitoring error: {e}")
                 time.sleep(60)  # Wait before retrying
+                
+            # Process any remaining mentions in buffer at end of cycle
+            if self.mention_buffer:
+                logger.info(f"💾 End-of-cycle: Processing {len(self.mention_buffer)} mentions from buffer...")
+                self._process_praw_buffer_with_sentiment()
+                self.mention_buffer.clear()
     
     async def _process_subreddit_posts(self, data: dict, subreddit: str):
         """Process posts from focused subreddit monitoring"""
