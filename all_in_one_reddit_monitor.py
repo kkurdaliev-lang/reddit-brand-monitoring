@@ -1132,9 +1132,15 @@ def download_csv():
     
     return response
 
+@app.route('/test-route')
+def test_route():
+    """Simple test route to verify Flask routing is working"""
+    return jsonify({"status": "success", "message": "Flask routing is working!", "timestamp": datetime.utcnow().isoformat()})
+
 @app.route('/backfill/<subreddit>')
 def backfill_subreddit(subreddit):
     """Manually backfill recent mentions from a specific subreddit"""
+    print(f"🔄 Backfill requested for subreddit: {subreddit}")
     try:
         # Get recent posts from the subreddit (last 25 posts)
         import praw
@@ -1575,6 +1581,12 @@ def main():
         
         # Start Flask - this should work since our test worked
         print(f"🔍 Health check: http://localhost:{port}/health")
+        
+        # Log all registered routes for debugging
+        print("📋 Registered Flask routes:")
+        for rule in app.url_map.iter_rules():
+            print(f"   {rule.rule} -> {rule.endpoint}")
+        
         app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
         
     except Exception as e:
