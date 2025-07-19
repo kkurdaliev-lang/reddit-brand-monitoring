@@ -206,6 +206,8 @@ class RedditMonitor:
         self.sentiment = SentimentAnalyzer(config['hf_api_token'])
         self.seen_ids = self.db.get_existing_ids()
         logger.info(f"🔍 Loaded {len(self.seen_ids)} existing IDs to prevent duplicates")
+        if self.seen_ids:
+            logger.info(f"🔍 Sample existing IDs: {list(self.seen_ids)[:5]}")  # Show first 5 IDs
         self.mention_buffer: List[Mention] = []  # For PRAW mention objects
         self.json_mention_buffer = []  # For JSON mention dictionaries
         self.running = False
@@ -519,6 +521,10 @@ class RedditMonitor:
         """Monitor comments using PRAW"""
         logger.info("Starting PRAW comment monitoring...")
         
+        # Add startup delay to avoid processing recent comments that might be in database
+        logger.info("⏳ Waiting 30 seconds to avoid processing recent comments...")
+        time.sleep(30)
+        
         while self.running:
             try:
                 # Monitor all Reddit comments
@@ -526,7 +532,9 @@ class RedditMonitor:
                     subreddit = self.reddit.subreddit("all")
                 else:
                     subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
+                # Use skip_existing=True but also manually track to ensure no duplicates
                 comment_stream = subreddit.stream.comments(skip_existing=True, pause_after=5)
+                logger.info(f"🎯 Starting comment stream for {subreddit} (skip_existing=True)")
                 
                 for comment in comment_stream:
                     if not self.running:
@@ -537,6 +545,7 @@ class RedditMonitor:
                         continue
                     
                     if comment.id in self.seen_ids:
+                        logger.debug(f"⏭️ Skipping already processed comment: {comment.id}")
                         continue
                     
                     # Debug: Log every 100th comment to see what we're processing
@@ -585,9 +594,9 @@ class RedditMonitor:
                                 # Save to database IMMEDIATELY
                                 self.db.insert_mentions([mention])
                                 self.seen_ids.add(comment.id)
-                                logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment}")
+                                logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment} (ID: {comment.id})")
                             else:
-                                logger.debug(f"⏭️ Skipped duplicate comment {comment.id}")
+                                logger.info(f"⏭️ Skipped duplicate comment {comment.id} for brand {brand}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -607,6 +616,10 @@ class RedditMonitor:
     def _monitor_praw_posts(self):
         """Monitor posts using PRAW"""
         logger.info("Starting PRAW post monitoring...")
+        
+        # Add startup delay to avoid processing recent posts that might be in database  
+        logger.info("⏳ Waiting 30 seconds to avoid processing recent posts...")
+        time.sleep(30)
         
         while self.running:
             try:
