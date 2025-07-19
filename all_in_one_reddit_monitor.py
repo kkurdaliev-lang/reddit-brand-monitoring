@@ -154,14 +154,17 @@ class SentimentAnalyzer:
         self.api_url = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
         self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
     
-    async def analyze(self, text: str) -> str:
-        """Analyze sentiment of text"""
-        if not self.api_token or not text.strip():
+    async def analyze(self, context_text: str) -> str:
+        """Analyze sentiment of brand-focused context text"""
+        if not self.api_token or not context_text.strip():
             return "neutral"
         
         try:
             async with aiohttp.ClientSession() as session:
-                payload = {"inputs": text[:500]}  # Limit text length
+                # Limit text length for API efficiency (focus on most relevant part)
+                focused_text = context_text[:400]  # Slightly shorter for better focus
+                payload = {"inputs": focused_text}
+                
                 async with session.post(self.api_url, headers=self.headers, json=payload) as response:
                     if response.status == 200:
                         result = await response.json()
@@ -169,14 +172,20 @@ class SentimentAnalyzer:
                             scores = result[0]
                             best_score = max(scores, key=lambda x: x['score'])
                             label = best_score['label'].lower()
+                            confidence = best_score['score']
                             
                             # Map labels to our sentiment system
                             if 'positive' in label:
-                                return 'positive'
+                                sentiment = 'positive'
                             elif 'negative' in label:
-                                return 'negative'
+                                sentiment = 'negative'
                             else:
-                                return 'neutral'
+                                sentiment = 'neutral'
+                            
+                            logger.debug(f"🎯 Sentiment: {sentiment} (confidence: {confidence:.2f})")
+                            return sentiment
+                    else:
+                        logger.warning(f"HuggingFace API returned status {response.status}")
         except Exception as e:
             logger.error(f"Sentiment analysis error: {e}")
         
@@ -246,11 +255,16 @@ class RedditMonitor:
         if not self.mention_buffer:
             return
         
-        # Add sentiment analysis
+        # Add focused sentiment analysis for brand mentions only
         for mention in self.mention_buffer:
             if mention.sentiment is None:
-                text = f"{mention.title or ''} {mention.body or ''}"
-                mention.sentiment = await self.sentiment.analyze(text)
+                # Extract context around the brand mention for focused sentiment analysis
+                context_text = self._extract_brand_context(mention)
+                if context_text:
+                    mention.sentiment = await self.sentiment.analyze(context_text)
+                    logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
+                else:
+                    mention.sentiment = "neutral"  # Fallback if no context found
         
         # Save to database
         self.db.insert_mentions(self.mention_buffer)
@@ -647,16 +661,63 @@ class RedditMonitor:
         try:
             for mention in self.mention_buffer:
                 if mention.sentiment is None:
-                    text = f"{mention.title or ''} {mention.body or ''}"
-                    # Run sentiment analysis synchronously
-                    mention.sentiment = loop.run_until_complete(self.sentiment.analyze(text))
+                    # Extract context around the brand mention for focused sentiment analysis
+                    context_text = self._extract_brand_context(mention)
+                    if context_text:
+                        # Run sentiment analysis on brand-focused context
+                        mention.sentiment = loop.run_until_complete(self.sentiment.analyze(context_text))
+                        logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
+                    else:
+                        mention.sentiment = "neutral"  # Fallback if no context found
             
             # Save to database
             self.db.insert_mentions(self.mention_buffer)
-            logger.info(f"💭 Processed {len(self.mention_buffer)} mentions with sentiment analysis")
+            logger.info(f"💭 Processed {len(self.mention_buffer)} brand mentions with sentiment analysis")
         
         finally:
             loop.close()
+    
+    def _extract_brand_context(self, mention):
+        """Extract context around brand mention for focused sentiment analysis"""
+        full_text = f"{mention.title or ''} {mention.body or ''}".lower()
+        brand_name = mention.brand.lower()
+        
+        # Handle multi-word brands like "devil walking"
+        if ' ' in brand_name:
+            brand_patterns = [brand_name, brand_name.replace(' ', '')]
+        else:
+            brand_patterns = [brand_name, brand_name.replace(' ', '')]
+        
+        # Find the brand in the text
+        brand_position = -1
+        matched_pattern = None
+        
+        for pattern in brand_patterns:
+            pos = full_text.find(pattern)
+            if pos != -1:
+                brand_position = pos
+                matched_pattern = pattern
+                break
+        
+        if brand_position == -1:
+            logger.warning(f"Brand '{brand_name}' not found in text for sentiment analysis")
+            return None
+        
+        # Extract context: 100 characters before and after the brand mention
+        context_start = max(0, brand_position - 100)
+        context_end = min(len(full_text), brand_position + len(matched_pattern) + 100)
+        
+        context = full_text[context_start:context_end].strip()
+        
+        # Ensure we have meaningful context (at least the brand + some words)
+        if len(context) < len(matched_pattern) + 10:
+            # If context is too short, use a bit more
+            context_start = max(0, brand_position - 200)
+            context_end = min(len(full_text), brand_position + len(matched_pattern) + 200)
+            context = full_text[context_start:context_end].strip()
+        
+        logger.debug(f"📝 Brand context for '{brand_name}': '{context[:100]}...'")
+        return context
      
     async def monitor_focused_subreddits(self):
         """Monitor high-priority subreddits for extra coverage"""
