@@ -212,11 +212,10 @@ class RedditMonitor:
                     client_secret=config['reddit']['client_secret'],
                     user_agent=config['reddit']['user_agent']
                 )
-                # Test the connection
-                self.reddit.user.me()
-                logger.info("✅ PRAW Reddit client authenticated successfully")
+                # Don't test connection during initialization to avoid blocking startup
+                logger.info("✅ PRAW Reddit client initialized (authentication will be tested during first use)")
             except Exception as e:
-                logger.error(f"❌ PRAW authentication failed: {e}")
+                logger.error(f"❌ PRAW initialization failed: {e}")
                 self.reddit = None
         else:
             self.reddit = None
@@ -841,11 +840,20 @@ def index():
 
 @app.route('/health')
 def health():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "monitoring": reddit_monitor.running if reddit_monitor else False
-    })
+    try:
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "monitoring": reddit_monitor.running if reddit_monitor else False,
+            "port": CONFIG['port']
+        })
+    except Exception as e:
+        # Return basic health check even if reddit_monitor isn't ready
+        return jsonify({
+            "status": "starting",
+            "timestamp": datetime.utcnow().isoformat(),
+            "error": str(e)
+        })
 
 @app.route('/data')
 def get_mentions():
@@ -1461,51 +1469,66 @@ def main():
     global db_manager, reddit_monitor
     
     print("🚀 Starting All-in-One Reddit Brand Monitor...")
-    
-    # Ensure data directory exists for persistent storage
-    data_dir = '/app/data'
-    if not os.path.exists(data_dir):
-        try:
-            os.makedirs(data_dir, exist_ok=True)
-            print(f"📁 Created data directory: {data_dir}")
-        except Exception as e:
-            print(f"⚠️ Could not create data directory: {e}")
-    
-    # Initialize database
-    db_manager = DatabaseManager(CONFIG['database_file'])
-    print(f"✅ Database initialized: {CONFIG['database_file']}")
-    
-    # Log storage info
-    if os.path.exists('/app/data'):
-        print("💾 Using persistent storage - data will survive redeploys!")
-    else:
-        print("⚠️ Using temporary storage - data will be lost on redeploy")
-    
-    # Initialize Reddit monitor
-    reddit_monitor = RedditMonitor(CONFIG, db_manager)
-    if CONFIG.get('monitor_all_reddit', False):
-        print("✅ Reddit monitor initialized - MONITORING ALL OF REDDIT 🌍")
-        focused_count = len(CONFIG.get('focused_subreddits', []))
-        print(f"✅ + Focused monitoring: {focused_count} priority subreddits")
-        print(f"✅ Brands: {', '.join(CONFIG['brands'].keys())}")
-    else:
-        print("✅ Reddit monitor initialized - monitoring specific subreddits")
-    
-    # Start monitoring in background thread
-    monitoring_thread = threading.Thread(target=run_monitoring_thread, daemon=True)
-    monitoring_thread.start()
-    print("✅ Background monitoring started")
-    
-    # Start Flask web interface
-    print(f"🌐 Starting web interface on port {CONFIG['port']}")
-    print(f"📊 Dashboard: http://localhost:{CONFIG['port']}")
-    print(f"🔍 Health check: http://localhost:{CONFIG['port']}/health")
+    print(f"🔧 Python version: {os.sys.version}")
+    print(f"🔧 Working directory: {os.getcwd()}")
+    print(f"🔧 PORT environment variable: {os.getenv('PORT', 'Not set')}")
     
     try:
-        app.run(host='0.0.0.0', port=CONFIG['port'], debug=False)
+        # Ensure data directory exists for persistent storage
+        data_dir = '/app/data'
+        if not os.path.exists(data_dir):
+            try:
+                os.makedirs(data_dir, exist_ok=True)
+                print(f"📁 Created data directory: {data_dir}")
+            except Exception as e:
+                print(f"⚠️ Could not create data directory: {e}")
+        
+        # Initialize database
+        print("🔄 Initializing database...")
+        db_manager = DatabaseManager(CONFIG['database_file'])
+        print(f"✅ Database initialized: {CONFIG['database_file']}")
+        
+        # Log storage info
+        if os.path.exists('/app/data'):
+            print("💾 Using persistent storage - data will survive redeploys!")
+        else:
+            print("⚠️ Using temporary storage - data will be lost on redeploy")
+        
+        # Initialize Reddit monitor
+        print("🔄 Initializing Reddit monitor...")
+        reddit_monitor = RedditMonitor(CONFIG, db_manager)
+        if CONFIG.get('monitor_all_reddit', False):
+            print("✅ Reddit monitor initialized - MONITORING ALL OF REDDIT 🌍")
+            focused_count = len(CONFIG.get('focused_subreddits', []))
+            print(f"✅ + Focused monitoring: {focused_count} priority subreddits")
+            print(f"✅ Brands: {', '.join(CONFIG['brands'].keys())}")
+        else:
+            print("✅ Reddit monitor initialized - monitoring specific subreddits")
+        
+        # Start monitoring in background thread
+        print("🔄 Starting background monitoring...")
+        monitoring_thread = threading.Thread(target=run_monitoring_thread, daemon=True)
+        monitoring_thread.start()
+        print("✅ Background monitoring started")
+        
+        # Start Flask web interface
+        print(f"🌐 Starting web interface on port {CONFIG['port']}")
+        print(f"📊 Dashboard: http://localhost:{CONFIG['port']}")
+        print(f"🔍 Health check: http://localhost:{CONFIG['port']}/health")
+        print("✅ Flask app starting...")
+        
+        # Make sure Flask starts properly
+        app.run(host='0.0.0.0', port=CONFIG['port'], debug=False, threaded=True)
+        
+    except Exception as e:
+        print(f"❌ Critical error during startup: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     except KeyboardInterrupt:
         print("\n⏹️  Shutting down...")
-        reddit_monitor.stop_monitoring()
+        if 'reddit_monitor' in globals():
+            reddit_monitor.stop_monitoring()
 
 if __name__ == "__main__":
     main()
