@@ -1,1 +1,1 @@
-web: python all_in_one_reddit_monitor.py
+web: python minimal_app.py
