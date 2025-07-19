@@ -205,7 +205,8 @@ class RedditMonitor:
         }
         self.sentiment = SentimentAnalyzer(config['hf_api_token'])
         self.seen_ids = self.db.get_existing_ids()
-        self.mention_buffer: List[Mention] = []
+        self.mention_buffer: List[Mention] = []  # For PRAW mention objects
+        self.json_mention_buffer = []  # For JSON mention dictionaries
         self.running = False
         
         # Initialize Reddit client
@@ -659,7 +660,7 @@ class RedditMonitor:
     
     def _process_json_buffer_with_sentiment(self):
         """Process JSON mention buffer with sentiment analysis (synchronous)"""
-        if not self.mention_buffer:
+        if not self.json_mention_buffer:
             return
         
         import asyncio
@@ -667,7 +668,7 @@ class RedditMonitor:
         asyncio.set_event_loop(loop)
         
         try:
-            for mention_dict in self.mention_buffer:
+            for mention_dict in self.json_mention_buffer:
                 # Extract context and analyze sentiment
                 context_text = mention_dict.get('context', mention_dict.get('content', ''))
                 if context_text and len(context_text) > 10:
@@ -899,7 +900,7 @@ class RedditMonitor:
                                         'score': c.get('score', 0)
                                     }
                                     
-                                    self.mention_buffer.append(mention_data)
+                                    self.json_mention_buffer.append(mention_data)
                                     seen_json_ids.add(cid)
                                     logger.info(f"🎯 Found {brand_name} mention in r/{c.get('subreddit')}")
                     
@@ -921,21 +922,21 @@ class RedditMonitor:
                     
                     time.sleep(base_delay)
                     
-                    # Process mention buffer periodically
-                    if self.mention_buffer:
-                        logger.info(f"💾 Processing {len(self.mention_buffer)} mentions from buffer...")
+                    # Process JSON mention buffer periodically
+                    if self.json_mention_buffer:
+                        logger.info(f"💾 Processing {len(self.json_mention_buffer)} JSON mentions from buffer...")
                         self._process_json_buffer_with_sentiment()
-                        self.mention_buffer.clear()
+                        self.json_mention_buffer.clear()
                     
             except Exception as e:
                 logger.error(f"JSON comment monitoring error: {e}")
                 time.sleep(60)  # Wait before retrying
                 
-            # Process any remaining mentions in buffer at end of cycle
-            if self.mention_buffer:
-                logger.info(f"💾 End-of-cycle: Processing {len(self.mention_buffer)} mentions from buffer...")
+            # Process any remaining JSON mentions in buffer at end of cycle
+            if self.json_mention_buffer:
+                logger.info(f"💾 End-of-cycle: Processing {len(self.json_mention_buffer)} JSON mentions from buffer...")
                 self._process_json_buffer_with_sentiment()
-                self.mention_buffer.clear()
+                self.json_mention_buffer.clear()
     
     async def _process_subreddit_posts(self, data: dict, subreddit: str):
         """Process posts from focused subreddit monitoring"""
@@ -1718,6 +1719,14 @@ def main():
                 print(f"📁 Created data directory: {data_dir}")
             except Exception as e:
                 print(f"⚠️ Could not create data directory: {e}")
+        
+        # Debug: Check if volume is properly mounted
+        print(f"🔍 Data directory exists: {os.path.exists(data_dir)}")
+        print(f"🔍 Data directory permissions: {oct(os.stat(data_dir).st_mode)[-3:] if os.path.exists(data_dir) else 'N/A'}")
+        print(f"🔍 Database file path: {CONFIG['database_file']}")
+        print(f"🔍 Database file exists: {os.path.exists(CONFIG['database_file'])}")
+        if os.path.exists(CONFIG['database_file']):
+            print(f"🔍 Database file size: {os.path.getsize(CONFIG['database_file'])} bytes")
         
         # Initialize database
         db_manager = DatabaseManager(CONFIG['database_file'])
