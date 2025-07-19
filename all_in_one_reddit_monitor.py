@@ -1168,8 +1168,9 @@ def backfill_subreddit(subreddit):
         for submission in reddit.subreddit(subreddit).new(limit=25):
             processed += 1
             # Check if this post contains brand mentions
-            for brand_name, brand_pattern in CONFIG['brands'].items():
+            for brand_name, brand_pattern_str in CONFIG['brands'].items():
                 title_text = f"{submission.title} {submission.selftext}"
+                brand_pattern = re.compile(brand_pattern_str, re.IGNORECASE)
                 if brand_pattern.search(title_text):
                     # This is a brand mention - save it
                     db_manager.add_mention(
@@ -1182,7 +1183,8 @@ def backfill_subreddit(subreddit):
             # Check recent comments on this post
             submission.comments.replace_more(limit=0)
             for comment in submission.comments.list()[:10]:  # Latest 10 comments
-                for brand_name, brand_pattern in CONFIG['brands'].items():
+                for brand_name, brand_pattern_str in CONFIG['brands'].items():
+                    brand_pattern = re.compile(brand_pattern_str, re.IGNORECASE)
                     if brand_pattern.search(comment.body):
                         db_manager.add_mention(
                             brand_name, f"Comment on: {submission.title}", 
