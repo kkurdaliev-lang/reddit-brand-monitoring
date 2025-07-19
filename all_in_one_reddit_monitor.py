@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 CONFIG = {
-    'database_file': '/app/data/reddit_monitor.db',
+    'database_file': os.getenv('DATABASE_PATH', '/app/data/reddit_monitor.db'),
     'reddit': {
         'client_id': os.getenv('REDDIT_CLIENT_ID', ''),
         'client_secret': os.getenv('REDDIT_CLIENT_SECRET', ''),
@@ -1757,21 +1757,43 @@ def main():
         print("🔄 Initializing database...")
         
         # Ensure data directory exists for persistent storage
-        data_dir = '/app/data'
+        data_dir = os.path.dirname(CONFIG['database_file'])
+        
+        # Create data directory with multiple fallback strategies
         if not os.path.exists(data_dir):
             try:
-                os.makedirs(data_dir, exist_ok=True)
+                os.makedirs(data_dir, mode=0o755, exist_ok=True)
                 print(f"📁 Created data directory: {data_dir}")
             except Exception as e:
-                print(f"⚠️ Could not create data directory: {e}")
+                print(f"⚠️ Could not create data directory {data_dir}: {e}")
+                # Fallback to current directory
+                CONFIG['database_file'] = 'reddit_monitor.db'
+                print(f"🔄 Falling back to current directory: {CONFIG['database_file']}")
         
-        # Debug: Check if volume is properly mounted
+        # Debug: Check volume mounting and permissions
+        print(f"🔍 Data directory: {data_dir}")
         print(f"🔍 Data directory exists: {os.path.exists(data_dir)}")
-        print(f"🔍 Data directory permissions: {oct(os.stat(data_dir).st_mode)[-3:] if os.path.exists(data_dir) else 'N/A'}")
+        if os.path.exists(data_dir):
+            print(f"🔍 Data directory permissions: {oct(os.stat(data_dir).st_mode)[-3:]}")
+            print(f"🔍 Data directory writable: {os.access(data_dir, os.W_OK)}")
+        
         print(f"🔍 Database file path: {CONFIG['database_file']}")
         print(f"🔍 Database file exists: {os.path.exists(CONFIG['database_file'])}")
         if os.path.exists(CONFIG['database_file']):
             print(f"🔍 Database file size: {os.path.getsize(CONFIG['database_file'])} bytes")
+            # Count existing mentions to verify persistence
+            try:
+                import sqlite3
+                conn = sqlite3.connect(CONFIG['database_file'])
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM mentions")
+                count = cursor.fetchone()[0]
+                conn.close()
+                print(f"🔍 Existing mentions in database: {count}")
+            except Exception as e:
+                print(f"🔍 Could not count existing mentions: {e}")
+        else:
+            print(f"🔍 Database file will be created at: {CONFIG['database_file']}")
         
         # Initialize database
         db_manager = DatabaseManager(CONFIG['database_file'])
