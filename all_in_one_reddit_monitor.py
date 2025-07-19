@@ -655,6 +655,42 @@ class RedditMonitor:
                 logger.error(f"PRAW post monitoring error: {e}")
                 time.sleep(30)
     
+    def _process_json_buffer_with_sentiment(self):
+        """Process JSON mention buffer with sentiment analysis (synchronous)"""
+        if not self.mention_buffer:
+            return
+        
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            for mention_dict in self.mention_buffer:
+                # Extract context and analyze sentiment
+                context_text = mention_dict.get('context', mention_dict.get('content', ''))
+                if context_text and len(context_text) > 10:
+                    sentiment = loop.run_until_complete(self.sentiment.analyze(context_text))
+                    logger.debug(f"💭 Analyzed sentiment for '{mention_dict['brand']}': {sentiment}")
+                else:
+                    sentiment = "neutral"
+                
+                # Save to database directly
+                self.db.add_mention(
+                    mention_dict['brand'],
+                    mention_dict['title'], 
+                    mention_dict['content'],
+                    mention_dict['location'],
+                    mention_dict['url'],
+                    sentiment,
+                    mention_dict['created']
+                )
+                logger.info(f"✅ Saved {mention_dict['brand']} mention to database")
+                
+        except Exception as e:
+            logger.error(f"Error processing JSON buffer: {e}")
+        finally:
+            loop.close()
+    
     def _process_praw_buffer_with_sentiment(self):
         """Process PRAW mention buffer with sentiment analysis (synchronous)"""
         if not self.mention_buffer:
@@ -879,7 +915,7 @@ class RedditMonitor:
                     # Process mention buffer periodically
                     if self.mention_buffer:
                         logger.info(f"💾 Processing {len(self.mention_buffer)} mentions from buffer...")
-                        self._process_praw_buffer_with_sentiment()
+                        self._process_json_buffer_with_sentiment()
                         self.mention_buffer.clear()
                     
             except Exception as e:
@@ -889,7 +925,7 @@ class RedditMonitor:
             # Process any remaining mentions in buffer at end of cycle
             if self.mention_buffer:
                 logger.info(f"💾 End-of-cycle: Processing {len(self.mention_buffer)} mentions from buffer...")
-                self._process_praw_buffer_with_sentiment()
+                self._process_json_buffer_with_sentiment()
                 self.mention_buffer.clear()
     
     async def _process_subreddit_posts(self, data: dict, subreddit: str):
