@@ -752,9 +752,8 @@ class RedditMonitor:
                     if not self.running:
                         break
                     
-                    # Monitor both posts and comments for each focused subreddit
+                    # Monitor posts for each focused subreddit (comments handled by JSON chunked monitoring)
                     await self._monitor_subreddit_posts(subreddit)
-                    await self._monitor_subreddit_comments(subreddit)
                     
                     # Small delay between monitoring different content types
                     await asyncio.sleep(1)
