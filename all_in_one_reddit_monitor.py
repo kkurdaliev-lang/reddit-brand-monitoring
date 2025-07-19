@@ -6,6 +6,7 @@ All-in-One Reddit Brand Monitor
 - Built-in web interface
 - Real-time monitoring
 - Perfect for commercial deployment
+- Now monitoring ALL of Reddit!
 """
 
 import asyncio
@@ -23,7 +24,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set, Optional
 from dataclasses import dataclass, asdict
-from flask import Flask, render_template, render_template_string, jsonify, request, send_file
+from flask import Flask, render_template_string, jsonify, request, send_file
 import os
 from contextlib import contextmanager
 import tempfile
@@ -99,24 +100,20 @@ class DatabaseManager:
             # Create indexes for better performance
             conn.execute('CREATE INDEX IF NOT EXISTS idx_brand ON mentions(brand)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_created ON mentions(created)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_type ON mentions(type)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_subreddit ON mentions(subreddit)')
-            
             conn.commit()
-            logger.info("Database initialized successfully")
     
     @contextmanager
     def get_connection(self):
-        """Get database connection with context manager"""
-        conn = sqlite3.connect(self.db_file, timeout=30.0)
-        conn.row_factory = sqlite3.Row
+        """Context manager for database connections"""
+        conn = sqlite3.connect(self.db_file)
         try:
             yield conn
         finally:
             conn.close()
     
     def insert_mentions(self, mentions: List[Mention]):
-        """Insert mentions into database"""
+        """Insert multiple mentions, handling duplicates"""
         if not mentions:
             return
         
@@ -124,8 +121,7 @@ class DatabaseManager:
             for mention in mentions:
                 conn.execute('''
                     INSERT OR REPLACE INTO mentions 
-                    (id, type, title, body, permalink, created, subreddit, author, 
-                     score, sentiment, brand, source)
+                    (id, type, title, body, permalink, created, subreddit, author, score, sentiment, brand, source)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     mention.id, mention.type, mention.title, mention.body,
@@ -133,70 +129,51 @@ class DatabaseManager:
                     mention.author, mention.score, mention.sentiment,
                     mention.brand, mention.source
                 ))
-            
             conn.commit()
-            logger.info(f"Inserted {len(mentions)} mentions")
+            logger.info(f"Inserted {len(mentions)} mentions into database")
     
     def get_existing_ids(self) -> Set[str]:
-        """Get all existing mention IDs"""
+        """Get set of existing mention IDs to avoid duplicates"""
         with self.get_connection() as conn:
-            cursor = conn.execute('SELECT id FROM mentions')
-            return {row[0] for row in cursor.fetchall()}
-    
-    def execute_query(self, query: str, params: tuple = ()) -> List[sqlite3.Row]:
-        """Execute a query and return results"""
-        with self.get_connection() as conn:
-            cursor = conn.execute(query, params)
-            return cursor.fetchall()
+            cursor = conn.execute("SELECT id FROM mentions")
+            return set(row[0] for row in cursor.fetchall())
 
 class SentimentAnalyzer:
     def __init__(self, api_token: str):
-        self.api_url = "https://api-inference.huggingface.co/models/tabularisai/multilingual-sentiment-analysis"
-        self.headers = {"Authorization": f"Bearer {api_token}"}
-        self.last_request = 0
-        self.min_delay = 1.0  # Minimum delay between requests
+        self.api_token = api_token
+        self.api_url = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
+        self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
     
     async def analyze(self, text: str) -> str:
         """Analyze sentiment of text"""
-        if not text or len(text.strip()) == 0 or not self.headers.get("Authorization") or "Bearer " not in self.headers.get("Authorization"):
+        if not self.api_token or not text.strip():
             return "neutral"
-        
-        # Rate limiting
-        now = time.time()
-        if now - self.last_request < self.min_delay:
-            await asyncio.sleep(self.min_delay - (now - self.last_request))
         
         try:
             async with aiohttp.ClientSession() as session:
-                payload = {"inputs": text[:1000]}
-                async with session.post(
-                    self.api_url,
-                    headers=self.headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    self.last_request = time.time()
-                    
+                payload = {"inputs": text[:500]}  # Limit text length
+                async with session.post(self.api_url, headers=self.headers, json=payload) as response:
                     if response.status == 200:
                         result = await response.json()
-                        scores = result[0]
-                        top_label = max(scores, key=lambda x: x['score'])['label'].lower()
-                        
-                        if 'positive' in top_label:
-                            return "positive"
-                        elif 'negative' in top_label:
-                            return "negative"
-                        else:
-                            return "neutral"
-                    else:
-                        logger.warning(f"Sentiment API returned {response.status}")
-                        return "neutral"
+                        if result and isinstance(result, list) and result[0]:
+                            scores = result[0]
+                            best_score = max(scores, key=lambda x: x['score'])
+                            label = best_score['label'].lower()
+                            
+                            # Map labels to our sentiment system
+                            if 'positive' in label:
+                                return 'positive'
+                            elif 'negative' in label:
+                                return 'negative'
+                            else:
+                                return 'neutral'
         except Exception as e:
-            logger.error(f"Sentiment analysis failed: {e}")
-            return "neutral"
+            logger.error(f"Sentiment analysis error: {e}")
+        
+        return "neutral"
 
 class RedditMonitor:
-    def __init__(self, config: Dict, db: DatabaseManager):
+    def __init__(self, config: dict, db: DatabaseManager):
         self.config = config
         self.db = db
         self.brands = {
@@ -287,35 +264,40 @@ class RedditMonitor:
             feed = feedparser.parse(rss_text)
             
             for entry in feed.entries:
-                post_id = entry.link.split('/')[-2] if '/' in entry.link else entry.link.split('/')[-1]
+                if not self.running:
+                    break
                 
-                if post_id in self.seen_ids:
+                # Extract Reddit ID from link
+                reddit_id = entry.link.split('/')[-2] if entry.link else entry.id
+                
+                if reddit_id in self.seen_ids:
                     continue
                 
-                title = entry.title
-                content = getattr(entry, 'summary', '')
-                text = f"{title} {content}"
+                # Check title and description for brand mentions
+                title = getattr(entry, 'title', '')
+                description = getattr(entry, 'summary', '')
+                full_text = f"{title} {description}"
                 
-                brands = self.find_brands(text)
+                brands = self.find_brands(full_text)
                 if brands:
                     for brand in brands:
                         mention = Mention(
-                            id=post_id,
+                            id=reddit_id,
                             type="post",
                             title=title,
-                            body=content,
+                            body=description,
                             permalink=entry.link,
-                            created=datetime.now(timezone.utc).isoformat(),
+                            created=datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc).isoformat(),
                             subreddit=subreddit,
-                            author="unknown",
-                            score=0,
+                            author=getattr(entry, 'author', 'unknown'),
+                            score=0,  # RSS doesn't provide scores
                             sentiment=None,
                             brand=brand,
                             source="rss"
                         )
                         
                         self.mention_buffer.append(mention)
-                        self.seen_ids.add(post_id)
+                        self.seen_ids.add(reddit_id)
                         logger.info(f"Found RSS mention: {brand} in r/{subreddit}")
                         
         except Exception as e:
@@ -375,51 +357,55 @@ class RedditMonitor:
                 await asyncio.sleep(30)  # Wait before next cycle
                 
             except Exception as e:
-                logger.error(f"JSON monitoring error: {e}")
+                logger.error(f"JSON API monitoring error: {e}")
                 await asyncio.sleep(60)
     
-    def _chunk_subreddits(self, chunk_size: int = 3):
-        """Split subreddits into chunks"""
+    def _chunk_subreddits(self, chunk_size: int = 10):
+        """Split subreddits into chunks for API efficiency"""
         subreddits = self.config['subreddits']
         for i in range(0, len(subreddits), chunk_size):
             yield subreddits[i:i + chunk_size]
     
-    async def _process_json_comments(self, data: Dict):
-        """Process comments from JSON API"""
-        children = data.get("data", {}).get("children", [])
-        
-        for item in children:
-            comment_data = item.get("data", {})
-            comment_id = comment_data.get("id")
-            
-            if not comment_id or comment_id in self.seen_ids:
-                continue
-            
-            body = comment_data.get("body", "")
-            if len(body) < 10:  # Skip very short comments
-                continue
-            
-            brands = self.find_brands(body)
-            if brands:
-                for brand in brands:
-                    mention = Mention(
-                        id=comment_id,
-                        type="comment",
-                        title=None,
-                        body=body,
-                        permalink=f"https://reddit.com{comment_data['permalink']}",
-                        created=datetime.fromtimestamp(comment_data["created_utc"], tz=timezone.utc).isoformat(),
-                        subreddit=comment_data["subreddit"],
-                        author=comment_data["author"],
-                        score=comment_data["score"],
-                        sentiment=None,
-                        brand=brand,
-                        source="json"
-                    )
+    async def _process_json_comments(self, data: dict):
+        """Process JSON API comment data"""
+        try:
+            if 'data' in data and 'children' in data['data']:
+                for item in data['data']['children']:
+                    if not self.running:
+                        break
                     
-                    self.mention_buffer.append(mention)
-                    self.seen_ids.add(comment_id)
-                    logger.info(f"Found JSON mention: {brand} in r/{comment_data['subreddit']}")
+                    comment_data = item['data']
+                    comment_id = comment_data.get('id')
+                    
+                    if comment_id in self.seen_ids:
+                        continue
+                    
+                    body = comment_data.get('body', '')
+                    brands = self.find_brands(body)
+                    
+                    if brands:
+                        for brand in brands:
+                            mention = Mention(
+                                id=comment_id,
+                                type="comment",
+                                title=None,
+                                body=body,
+                                permalink=f"https://reddit.com{comment_data.get('permalink', '')}",
+                                created=datetime.fromtimestamp(comment_data.get('created_utc', 0), tz=timezone.utc).isoformat(),
+                                subreddit=comment_data.get('subreddit', 'unknown'),
+                                author=comment_data.get('author', 'unknown'),
+                                score=comment_data.get('score', 0),
+                                sentiment=None,
+                                brand=brand,
+                                source="json_api"
+                            )
+                            
+                            self.mention_buffer.append(mention)
+                            self.seen_ids.add(comment_id)
+                            logger.info(f"Found JSON mention: {brand} in r/{comment_data['subreddit']}")
+                            
+        except Exception as e:
+            logger.error(f"JSON processing error: {e}")
     
     async def start_monitoring(self):
         """Start all monitoring tasks"""
@@ -531,159 +517,203 @@ def get_mentions():
     
     # Build query
     offset = (page - 1) * per_page
-    query = '''
-        SELECT * FROM mentions 
-        WHERE brand = ? 
-        ORDER BY created DESC 
-        LIMIT ? OFFSET ?
-    '''
     
-    mentions = db_manager.execute_query(query, (brand, per_page, offset))
+    with db_manager.get_connection() as conn:
+        if brand:
+            query = '''
+                SELECT id, type, title, body, permalink, created, subreddit, author, score, sentiment, brand, source
+                FROM mentions 
+                WHERE brand = ?
+                ORDER BY created DESC 
+                LIMIT ? OFFSET ?
+            '''
+            cursor = conn.execute(query, (brand, per_page, offset))
+        else:
+            query = '''
+                SELECT id, type, title, body, permalink, created, subreddit, author, score, sentiment, brand, source
+                FROM mentions 
+                ORDER BY created DESC 
+                LIMIT ? OFFSET ?
+            '''
+            cursor = conn.execute(query, (per_page, offset))
+        
+        mentions = cursor.fetchall()
     
-    return jsonify({
-        "results": [dict(row) for row in mentions],
-        "pagination": {"page": page, "per_page": per_page}
-    })
+    # Convert to list of dicts
+    results = []
+    for mention in mentions:
+        results.append({
+            'id': mention[0],
+            'type': mention[1],
+            'title': mention[2],
+            'body': mention[3],
+            'permalink': mention[4],
+            'created': mention[5],
+            'subreddit': mention[6],
+            'author': mention[7],
+            'score': mention[8],
+            'sentiment': mention[9],
+            'brand': mention[10],
+            'source': mention[11]
+        })
+    
+    return jsonify(results)
 
 @app.route('/stats')
 def get_stats():
     brand = request.args.get('brand', list(CONFIG['brands'].keys())[0])
+    tz_offset = int(request.args.get('tz_offset', 0))
     
-    # Today's stats
-    today = datetime.now().strftime('%Y-%m-%d')
-    daily_query = '''
-        SELECT 
-            COUNT(CASE WHEN type = 'post' THEN 1 END) as posts,
-            COUNT(CASE WHEN type = 'comment' THEN 1 END) as comments
-        FROM mentions 
-        WHERE brand = ? AND date(created) = ?
-    '''
-    daily_stats = db_manager.execute_query(daily_query, (brand, today))[0]
+    with db_manager.get_connection() as conn:
+        # Daily stats
+        daily_query = '''
+            SELECT type, COUNT(*) 
+            FROM mentions 
+            WHERE brand = ? AND DATE(created) = DATE('now') 
+            GROUP BY type
+        '''
+        daily_cursor = conn.execute(daily_query, (brand,))
+        daily_results = dict(daily_cursor.fetchall())
+        
+        # Total stats
+        total_query = '''
+            SELECT type, COUNT(*) 
+            FROM mentions 
+            WHERE brand = ? 
+            GROUP BY type
+        '''
+        total_cursor = conn.execute(total_query, (brand,))
+        total_results = dict(total_cursor.fetchall())
+        
+        # Sentiment stats
+        sentiment_query = '''
+            SELECT sentiment, COUNT(*) 
+            FROM mentions 
+            WHERE brand = ? AND sentiment IS NOT NULL 
+            GROUP BY sentiment
+        '''
+        sentiment_cursor = conn.execute(sentiment_query, (brand,))
+        sentiment_results = dict(sentiment_cursor.fetchall())
     
-    # Total stats
-    total_query = '''
-        SELECT 
-            COUNT(CASE WHEN type = 'post' THEN 1 END) as posts,
-            COUNT(CASE WHEN type = 'comment' THEN 1 END) as comments
-        FROM mentions 
-        WHERE brand = ?
-    '''
-    total_stats = db_manager.execute_query(total_query, (brand,))[0]
-    
-    # Sentiment stats
-    sentiment_query = '''
-        SELECT sentiment, COUNT(*) as count
-        FROM mentions 
-        WHERE brand = ? AND sentiment IS NOT NULL
-        GROUP BY sentiment
-    '''
-    sentiment_stats = {row[0]: row[1] for row in db_manager.execute_query(sentiment_query, (brand,))}
-    
-    # Calculate sentiment score
-    pos = sentiment_stats.get('positive', 0)
-    neu = sentiment_stats.get('neutral', 0)
-    neg = sentiment_stats.get('negative', 0)
-    total = pos + neu + neg
-    score = round((pos * 100 + neu * 50) / total) if total > 0 else 0
+    # Calculate score (simple sentiment-based scoring)
+    total_sentiment = sum(sentiment_results.values())
+    if total_sentiment > 0:
+        positive_ratio = sentiment_results.get('positive', 0) / total_sentiment
+        negative_ratio = sentiment_results.get('negative', 0) / total_sentiment
+        score = max(0, min(100, int((positive_ratio - negative_ratio + 1) * 50)))
+    else:
+        score = 50  # Neutral when no sentiment data
     
     return jsonify({
-        "brand": brand,
-        "daily": {"posts": daily_stats[0], "comments": daily_stats[1]},
-        "total": {"posts": total_stats[0], "comments": total_stats[1]},
-        "sentiment": {"positive": pos, "neutral": neu, "negative": neg},
-        "score": score
+        'brand': brand,
+        'daily': {
+            'posts': daily_results.get('post', 0),
+            'comments': daily_results.get('comment', 0)
+        },
+        'total': {
+            'posts': total_results.get('post', 0),
+            'comments': total_results.get('comment', 0)
+        },
+        'sentiment': {
+            'positive': sentiment_results.get('positive', 0),
+            'negative': sentiment_results.get('negative', 0),
+            'neutral': sentiment_results.get('neutral', 0)
+        },
+        'score': score
     })
 
 @app.route('/trending_subreddits')
 def trending_subreddits():
-    brand = request.args.get('brand', list(CONFIG['brands'].keys())[0])
-    days = int(request.args.get('days', 7))
+    brand = request.args.get('brand')
     
-    cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    
-    query = '''
-        SELECT 
-            subreddit,
-            COUNT(*) as mention_count,
-            AVG(score) as avg_score,
-            COUNT(CASE WHEN sentiment = 'positive' THEN 1 END) as positive,
-            COUNT(CASE WHEN sentiment = 'negative' THEN 1 END) as negative
-        FROM mentions 
-        WHERE brand = ? AND date(created) >= ?
-        GROUP BY subreddit
-        ORDER BY mention_count DESC
-        LIMIT 10
-    '''
-    
-    results = db_manager.execute_query(query, (brand, cutoff_date))
+    with db_manager.get_connection() as conn:
+        if brand:
+            query = '''
+                SELECT subreddit, COUNT(*) as mention_count, GROUP_CONCAT(DISTINCT brand) as brands
+                FROM mentions 
+                WHERE brand = ?
+                GROUP BY subreddit 
+                ORDER BY mention_count DESC 
+                LIMIT 20
+            '''
+            cursor = conn.execute(query, (brand,))
+        else:
+            query = '''
+                SELECT subreddit, COUNT(*) as mention_count, GROUP_CONCAT(DISTINCT brand) as brands
+                FROM mentions 
+                GROUP BY subreddit 
+                ORDER BY mention_count DESC 
+                LIMIT 20
+            '''
+            cursor = conn.execute(query)
+        
+        results = cursor.fetchall()
     
     trending = []
-    for row in results:
-        subreddit, count, avg_score, pos, neg = row
+    for subreddit, count, brands in results:
         trending.append({
-            "subreddit": subreddit,
-            "mention_count": count,
-            "avg_score": float(avg_score) if avg_score else 0,
-            "positive_mentions": pos,
-            "negative_mentions": neg,
-            "sentiment_ratio": pos / (pos + neg) if (pos + neg) > 0 else 0.5
+            'subreddit': subreddit,
+            'mention_count': count,
+            'brands': brands.split(',') if brands else []
         })
     
     return jsonify(trending)
 
 @app.route('/export')
-def export_data():
-    brand = request.args.get('brand', list(CONFIG['brands'].keys())[0])
+def export_mentions():
+    brand = request.args.get('brand')
     
-    query = '''
-        SELECT * FROM mentions 
-        WHERE brand = ? 
-        ORDER BY created DESC 
-        LIMIT 5000
-    '''
-    
-    mentions = db_manager.execute_query(query, (brand,))
+    with db_manager.get_connection() as conn:
+        if brand:
+            query = "SELECT * FROM mentions WHERE brand = ? ORDER BY created DESC"
+            cursor = conn.execute(query, (brand,))
+        else:
+            query = "SELECT * FROM mentions ORDER BY created DESC"
+            cursor = conn.execute(query)
+        
+        mentions = cursor.fetchall()
     
     # Create CSV
     output = io.StringIO()
     writer = csv.writer(output)
     
-    # Header
-    if mentions:
-        writer.writerow(mentions[0].keys())
-        
-        # Data
-        for mention in mentions:
-            writer.writerow(mention)
+    # Write header
+    writer.writerow(['ID', 'Type', 'Title', 'Body', 'Permalink', 'Created', 'Subreddit', 'Author', 'Score', 'Sentiment', 'Brand', 'Source'])
     
-    output.seek(0)
+    # Write data
+    for mention in mentions:
+        writer.writerow(mention)
+    
+    # Create file response
+    csv_output = output.getvalue()
+    output.close()
     
     return send_file(
-        io.BytesIO(output.getvalue().encode('utf-8')),
-        mimetype='text/csv',
+        io.BytesIO(csv_output.encode('utf-8')),
         as_attachment=True,
-        download_name=f'{brand}_mentions_{datetime.now().strftime("%Y%m%d")}.csv'
+        download_name=f'reddit_mentions_{brand or "all"}_{datetime.now().strftime("%Y%m%d")}.csv',
+        mimetype='text/csv'
     )
 
 @app.route('/system_status')
 def system_status():
-    # Database stats
-    total_mentions = db_manager.execute_query("SELECT COUNT(*) FROM mentions")[0][0]
-    total_brands = len(CONFIG['brands'])
-    
-    # Source breakdown
-    source_query = '''
-        SELECT source, COUNT(*), MAX(created) as last_update
-        FROM mentions 
-        GROUP BY source
-    '''
-    sources = []
-    for row in db_manager.execute_query(source_query):
-        sources.append({
-            "source": row[0],
-            "count": row[1],
-            "last_update": row[2]
-        })
+    with db_manager.get_connection() as conn:
+        # Get total mentions
+        total_cursor = conn.execute("SELECT COUNT(*) FROM mentions")
+        total_mentions = total_cursor.fetchone()[0]
+        
+        # Get total brands
+        brands_cursor = conn.execute("SELECT COUNT(DISTINCT brand) FROM mentions")
+        total_brands = brands_cursor.fetchone()[0]
+        
+        # Get data sources
+        source_query = '''
+            SELECT source, COUNT(*) as count 
+            FROM mentions 
+            GROUP BY source
+        '''
+        source_cursor = conn.execute(source_query)
+        sources = dict(source_cursor.fetchall())
     
     return jsonify({
         "total_mentions": total_mentions,
@@ -714,501 +744,371 @@ def delete_mention():
 def favicon():
     return '', 204  # No content, prevents 404 errors
 
-# HTML Template (embedded)
+@app.route('/download')
+def download_csv():
+    """Download all mentions as CSV"""
+    brand = request.args.get('brand')
+    
+    with db_manager.get_connection() as conn:
+        if brand:
+            query = "SELECT * FROM mentions WHERE brand = ? ORDER BY created DESC"
+            cursor = conn.execute(query, (brand,))
+        else:
+            query = "SELECT * FROM mentions ORDER BY created DESC"
+            cursor = conn.execute(query)
+        
+        mentions = cursor.fetchall()
+    
+    # Create CSV output
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write header
+    writer.writerow(['ID', 'Type', 'Brand', 'Subreddit', 'Author', 'Title', 'Body', 
+                     'Permalink', 'Created', 'Score', 'Sentiment', 'Source'])
+    
+    # Write data
+    for mention in mentions:
+        writer.writerow(mention)
+    
+    # Create response
+    csv_output = output.getvalue()
+    output.close()
+    
+    response = app.response_class(
+        csv_output,
+        mimetype='text/csv',
+        headers={
+            'Content-Disposition': f'attachment; filename=reddit_mentions_{brand or "all"}_{datetime.now().strftime("%Y%m%d")}.csv'
+        }
+    )
+    
+    return response
+
+@app.route('/weekly_mentions')
+def weekly_mentions():
+    """Get weekly mention counts for charts"""
+    brand = request.args.get('brand', 'badinka')
+    tz = request.args.get('tz', 'UTC')
+    week_offset = int(request.args.get('week_offset', 0))
+    
+    # Calculate the start of the week (Monday)
+    today = datetime.now()
+    days_since_monday = today.weekday()
+    monday = today - timedelta(days=days_since_monday) + timedelta(weeks=week_offset)
+    monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Get mentions for the week
+    with db_manager.get_connection() as conn:
+        query = '''
+            SELECT DATE(created) as date, COUNT(*) as count
+            FROM mentions 
+            WHERE brand = ? 
+            AND created >= ? 
+            AND created < ?
+            GROUP BY DATE(created)
+            ORDER BY date
+        '''
+        
+        start_date = monday.isoformat()
+        end_date = (monday + timedelta(days=7)).isoformat()
+        
+        cursor = conn.execute(query, (brand, start_date, end_date))
+        results = cursor.fetchall()
+    
+    # Convert to dictionary format expected by frontend
+    weekly_data = {}
+    for date_str, count in results:
+        # Convert to frontend format (YYYY-MM-DD)
+        weekly_data[date_str] = count
+    
+    return jsonify(weekly_data)
+
+# HTML Template (embedded) - User's Preferred Version
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Reddit Brand Monitor - All-in-One</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-            background: #f8fafc; color: #334155; line-height: 1.6;
-        }
-        .header { 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white; padding: 2rem; text-align: center;
-        }
-        .header h1 { font-size: 2.5rem; margin-bottom: 0.5rem; }
-        .header p { opacity: 0.9; font-size: 1.1rem; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
-        .tabs { display: flex; gap: 0.5rem; margin-bottom: 2rem; flex-wrap: wrap; }
-        .tab { 
-            padding: 0.75rem 1.5rem; background: white; border: none; 
-            border-radius: 8px; cursor: pointer; font-weight: 500;
-            transition: all 0.2s; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .tab:hover { transform: translateY(-1px); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
-        .tab.active { background: #667eea; color: white; }
-        .stats-grid { 
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem; margin-bottom: 2rem;
-        }
-        .stat-card { 
-            background: white; padding: 1.5rem; border-radius: 12px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;
-        }
-        .stat-number { font-size: 2rem; font-weight: bold; color: #667eea; }
-        .stat-label { color: #64748b; margin-top: 0.5rem; font-size: 0.9rem; }
-        .content-section { 
-            background: white; border-radius: 12px; padding: 1.5rem;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 2rem;
-        }
-        .mentions-table { width: 100%; border-collapse: collapse; }
-        .mentions-table th, .mentions-table td { 
-            padding: 0.75rem; text-align: left; border-bottom: 1px solid #e2e8f0;
-        }
-        .mentions-table th { background: #f8fafc; font-weight: 600; }
-        .badge { 
-            padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.8rem;
-            font-weight: 500; text-transform: capitalize;
-        }
-        .badge.positive { background: #dcfce7; color: #166534; }
-        .badge.neutral { background: #f1f5f9; color: #475569; }
-        .badge.negative { background: #fecaca; color: #991b1b; }
-        .btn { 
-            padding: 0.5rem 1rem; border: none; border-radius: 6px;
-            cursor: pointer; font-weight: 500; transition: all 0.2s;
-            margin: 0.25rem;
-        }
-        .btn-primary { background: #667eea; color: white; }
-        .btn-primary:hover { background: #5a67d8; }
-        .btn-danger { background: #ef4444; color: white; font-size: 0.8rem; }
-        .btn-danger:hover { background: #dc2626; }
-        .filters { display: flex; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
-        .filter-input { 
-            padding: 0.5rem; border: 1px solid #d1d5db; border-radius: 6px;
-            font-size: 0.9rem;
-        }
-        .loading { text-align: center; padding: 2rem; color: #64748b; }
-        .charts-container { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
-        .chart-wrapper { text-align: center; }
-        .status-indicator { 
-            display: inline-block; width: 10px; height: 10px; border-radius: 50%;
-            margin-right: 5px;
-        }
-        .status-active { background: #22c55e; }
-        .status-inactive { background: #ef4444; }
-        @media (max-width: 768px) {
-            .charts-container { grid-template-columns: 1fr; }
-            .filters { flex-direction: column; }
-            .tabs { flex-direction: column; }
-            .stats-grid { grid-template-columns: 1fr; }
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <title>Reddit Brand Monitoring</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 20px; background-color: #f9f9f9; color: #333; }
+    h1, h2, h3 { color: #222; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; background-color: #fff; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+    th { background-color: #f0f0f0; }
+    button { padding: 6px 12px; font-size: 14px; cursor: pointer; border-radius: 4px; border: none; background-color: #007bff; color: white; }
+    button:disabled { background-color: #aaa; cursor: not-allowed; }
+    .badge { padding: 2px 6px; border-radius: 4px; color: white; font-size: 12px; text-transform: capitalize; }
+    .positive { background-color: limegreen; }
+    .neutral  { background-color: gray; }
+    .negative { background-color: red; }
+    #brand-buttons { margin-bottom: 20px; }
+    #brand-buttons button { margin-right: 10px; }
+    #stats-tab { display: none; }
+    .stats-container { display: flex; gap: 30px; align-items: flex-start; margin-top: 20px; }
+    .stat-block { flex: 1; background: #fff; padding: 16px; border: 1px solid #ddd; border-radius: 6px; }
+    .pdf-btn, .csv-btn { display: inline-block; margin-top: 10px; }
+    .score-label { font-weight: bold; color: white; padding: 4px 8px; border-radius: 4px; display: inline-block; }
+    .charts-table { width: 100%; table-layout: fixed; margin-top: 20px; }
+    .charts-table td { text-align: center; vertical-align: top; }
+    .charts-table canvas { width: 300px; height: 300px; }
+  </style>
 </head>
 <body>
-    <div class="header">
-        <h1>Reddit Brand Monitor</h1>
-        <p>All-in-One Real-time Brand Monitoring Solution</p>
+  <h1>Reddit Brand Monitoring - ALL OF REDDIT 🌍</h1>
+  <div id="brand-buttons">
+    <button id="btn-badinka" onclick="switchBrand('badinka')">My Brand</button>
+    <button id="btn-iheartraves" onclick="switchBrand('iheartraves')">My Competitor</button>
+    <button id="btn-stats" onclick="showStats()">Stats</button>
+  </div>
+  <p class="csv-btn">
+    <button id="csv-btn" onclick="window.location.href='/download'">📥 Download CSV</button>
+    <button id="pdf-btn" style="display:none;" onclick="downloadPDF()">📄 Download as PDF</button>
+  </p>
+
+  <div id="mentions-tab">
+    <table id="data-table">
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Subreddit</th>
+          <th>Author</th>
+          <th>Link</th>
+          <th>Created</th>
+          <th>Preview</th>
+          <th>Sentiment</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div id="stats-tab">
+    <h2>Head to head stats</h2>
+    <div class="stats-container">
+      <div id="stats-left" class="stat-block"></div>
+      <div id="stats-right" class="stat-block"></div>
     </div>
+    <table class="charts-table">
+      <tr>
+        <td><canvas id="pie-left"></canvas></td>
+        <td><canvas id="pie-right"></canvas></td>
+      </tr>
+      <tr>
+        <td>
+          <div style="text-align: center; margin-top: 30px;">
+            <button onclick="changeWeek(-1)">⬅️ Previous Week</button>
+            <span id="week-label-left" style="margin: 0 20px; font-weight: bold;">This Week</span>
+            <button onclick="changeWeek(1)">Next Week ➡️</button>
+          </div>
+          <canvas id="bar-left" style="margin-top: 20px; height: 300px;"></canvas>
+        </td>
+        <td>
+          <div style="text-align: center; margin-top: 30px;">
+            <button onclick="changeWeek(-1)">⬅️ Previous Week</button>
+            <span id="week-label-right" style="margin: 0 20px; font-weight: bold;">This Week</span>
+            <button onclick="changeWeek(1)">Next Week ➡️</button>
+          </div>
+          <canvas id="bar-right" style="margin-top: 20px; height: 300px;"></canvas>
+        </td>
+      </tr>
+    </table>
+  </div>
 
-    <div class="container">
-        <div class="tabs">
-            <button class="tab active" onclick="showTab('dashboard')" id="tab-dashboard">Dashboard</button>
-            <button class="tab" onclick="showTab('mentions')" id="tab-mentions">Live Mentions</button>
-            <button class="tab" onclick="showTab('analytics')" id="tab-analytics">Analytics</button>
-            <button class="tab" onclick="showTab('settings')" id="tab-settings">Settings</button>
-        </div>
+  <script>
+    let currentBrand = "badinka";
+    let charts = {};
+    let barCharts = { left: null, right: null };
+    let weekOffset = 0;
 
-        <!-- Dashboard Tab -->
-        <div id="dashboard-tab" class="tab-content">
-            <div class="stats-grid" id="stats-container">
-                <div class="loading">Loading stats...</div>
-            </div>
-            
-            <div class="content-section">
-                <h3>Recent Activity</h3>
-                <div class="charts-container">
-                    <div class="chart-wrapper">
-                        <h4>Sentiment Distribution</h4>
-                        <canvas id="sentiment-chart" width="300" height="300"></canvas>
-                    </div>
-                    <div class="chart-wrapper">
-                        <h4>Brand Comparison</h4>
-                        <canvas id="brand-chart" width="300" height="300"></canvas>
-                    </div>
-                </div>
-            </div>
-        </div>
+    function switchBrand(brand) {
+      currentBrand = brand;
+      document.getElementById("mentions-tab").style.display = "block";
+      document.getElementById("stats-tab").style.display = "none";
+      document.getElementById("btn-badinka").disabled = (brand === "badinka");
+      document.getElementById("btn-iheartraves").disabled = (brand === "iheartraves");
+      document.getElementById("btn-stats").disabled = false;
+      document.getElementById("csv-btn").style.display = 'inline-block';
+      document.getElementById("pdf-btn").style.display = 'none';
+      loadData();
+    }
 
-        <!-- Mentions Tab -->
-        <div id="mentions-tab" class="tab-content" style="display: none;">
-            <div class="content-section">
-                <div class="filters">
-                    <select class="filter-input" id="brand-filter">
-                        <!-- Populated by JavaScript -->
-                    </select>
-                    <button class="btn btn-primary" onclick="loadMentions()">Refresh</button>
-                    <button class="btn btn-primary" onclick="exportData()">Export CSV</button>
-                </div>
+    function showStats() {
+      document.getElementById("mentions-tab").style.display = "none";
+      document.getElementById("stats-tab").style.display = "block";
+      document.getElementById("btn-badinka").disabled = false;
+      document.getElementById("btn-iheartraves").disabled = false;
+      document.getElementById("btn-stats").disabled = true;
+      document.getElementById("csv-btn").style.display = 'none';
+      document.getElementById("pdf-btn").style.display = 'inline-block';
+      loadStats();
+    }
 
-                <table class="mentions-table">
-                    <thead>
-                        <tr>
-                            <th>Type</th>
-                            <th>Subreddit</th>
-                            <th>Author</th>
-                            <th>Content</th>
-                            <th>Created</th>
-                            <th>Score</th>
-                            <th>Sentiment</th>
-                            <th>Source</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="mentions-tbody">
-                        <tr><td colspan="9" class="loading">Loading mentions...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
+    function changeWeek(offset) {
+      weekOffset += offset;
+      loadWeeklyCharts();
+    }
 
-        <!-- Analytics Tab -->
-        <div id="analytics-tab" class="tab-content" style="display: none;">
-            <div class="content-section">
-                <h3>Trending Subreddits</h3>
-                <div id="trending-container" class="loading">Loading trending data...</div>
-            </div>
-        </div>
+    function getMonday(offset) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const monday = new Date(today);
+      monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7) + 7 * offset);
+      return monday;
+    }
 
-        <!-- Settings Tab -->
-        <div id="settings-tab" class="tab-content" style="display: none;">
-            <div class="content-section">
-                <h3>System Status</h3>
-                <div id="status-container" class="loading">Loading system status...</div>
-            </div>
-            
-            <div class="content-section">
-                <h3>Configuration</h3>
-                <p><strong>Brands Tracked:</strong> <span id="brands-list"></span></p>
-                <p><strong>Subreddits Monitored:</strong> <span id="subreddits-count"></span></p>
-                <p><strong>Database:</strong> SQLite (embedded)</p>
-                <p><strong>Monitoring Status:</strong> <span id="monitoring-status"></span></p>
-            </div>
-        </div>
-    </div>
+    function updateWeekLabel(monday) {
+      const sunday = new Date(monday);
+      sunday.setDate(monday.getDate() + 6);
+      const label = `${monday.toLocaleDateString()} - ${sunday.toLocaleDateString()}`;
+      document.getElementById("week-label-left").textContent = label;
+      document.getElementById("week-label-right").textContent = label;
+    }
 
-    <script>
-        let currentBrand = '';
-        let brands = [];
-        let charts = {};
-
-        // Initialize
-        async function init() {
-            try {
-                // Load system status to get brands
-                const response = await fetch('/system_status');
-                const status = await response.json();
-                
-                // Set up brand filter
-                const brandFilter = document.getElementById('brand-filter');
-                brandFilter.innerHTML = '';
-                
-                // Get brands from config (we'll need to expose this)
-                brands = ['badinka', 'iheartraves']; // Default brands
-                brands.forEach(brand => {
-                    const option = document.createElement('option');
-                    option.value = brand;
-                    option.textContent = brand.charAt(0).toUpperCase() + brand.slice(1);
-                    brandFilter.appendChild(option);
-                });
-                
-                currentBrand = brands[0];
-                
-                // Update settings
-                document.getElementById('brands-list').textContent = brands.join(', ');
-                document.getElementById('subreddits-count').textContent = '10+ communities';
-                
-                const monitoringStatus = status.monitoring_active ? 
-                    '<span class="status-indicator status-active"></span>Active' :
-                    '<span class="status-indicator status-inactive"></span>Inactive';
-                document.getElementById('monitoring-status').innerHTML = monitoringStatus;
-                
-                loadDashboard();
-            } catch (error) {
-                console.error('Initialization error:', error);
-            }
-        }
-
-        // Tab management
-        function showTab(tabName) {
-            document.querySelectorAll('.tab-content').forEach(tab => tab.style.display = 'none');
-            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-            
-            document.getElementById(tabName + '-tab').style.display = 'block';
-            document.getElementById('tab-' + tabName).classList.add('active');
-            
-            if (tabName === 'dashboard') loadDashboard();
-            else if (tabName === 'mentions') loadMentions();
-            else if (tabName === 'analytics') loadAnalytics();
-            else if (tabName === 'settings') loadSystemStatus();
-        }
-
-        // Load dashboard
-        async function loadDashboard() {
-            try {
-                const promises = brands.map(brand => 
-                    fetch(`/stats?brand=${brand}`).then(r => r.json())
-                );
-                const statsArray = await Promise.all(promises);
-                
-                renderStats(statsArray);
-                renderCharts(statsArray);
-            } catch (error) {
-                console.error('Error loading dashboard:', error);
-            }
-        }
-
-        function renderStats(statsArray) {
-            const container = document.getElementById('stats-container');
-            
-            let totalMentions = 0;
-            let totalToday = 0;
-            let avgScore = 0;
-            
-            statsArray.forEach(stats => {
-                totalMentions += stats.total.posts + stats.total.comments;
-                totalToday += stats.daily.posts + stats.daily.comments;
-                avgScore += stats.score;
-            });
-            
-            avgScore = avgScore / statsArray.length;
-            
-            container.innerHTML = `
-                <div class="stat-card">
-                    <div class="stat-number">${totalToday}</div>
-                    <div class="stat-label">Today's Mentions</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">${totalMentions}</div>
-                    <div class="stat-label">Total Mentions</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">${Math.round(avgScore)}/100</div>
-                    <div class="stat-label">Avg Sentiment</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">${brands.length}</div>
-                    <div class="stat-label">Brands Tracked</div>
-                </div>
-            `;
-        }
-
-        function renderCharts(statsArray) {
-            // Sentiment pie chart for current brand
-            const currentStats = statsArray[0] || {sentiment: {positive: 0, neutral: 0, negative: 0}};
-            
-            const sentimentCtx = document.getElementById('sentiment-chart').getContext('2d');
-            if (charts.sentiment) charts.sentiment.destroy();
-            
-            charts.sentiment = new Chart(sentimentCtx, {
-                type: 'pie',
-                data: {
-                    labels: ['Positive', 'Neutral', 'Negative'],
-                    datasets: [{
-                        data: [
-                            currentStats.sentiment.positive, 
-                            currentStats.sentiment.neutral, 
-                            currentStats.sentiment.negative
-                        ],
-                        backgroundColor: ['#22c55e', '#64748b', '#ef4444']
-                    }]
-                },
-                options: { 
-                    responsive: true, 
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { position: 'bottom' }
-                    }
-                }
-            });
-
-            // Brand comparison chart
-            const brandCtx = document.getElementById('brand-chart').getContext('2d');
-            if (charts.brand) charts.brand.destroy();
-            
-            const brandData = statsArray.map((stats, index) => ({
-                brand: brands[index] || `Brand ${index + 1}`,
-                mentions: stats.total.posts + stats.total.comments
-            }));
-            
-            charts.brand = new Chart(brandCtx, {
-                type: 'bar',
-                data: {
-                    labels: brandData.map(d => d.brand),
-                    datasets: [{
-                        label: 'Total Mentions',
-                        data: brandData.map(d => d.mentions),
-                        backgroundColor: '#667eea'
-                    }]
-                },
-                options: { 
-                    responsive: true, 
-                    maintainAspectRatio: false,
-                    scales: {
-                        y: { beginAtZero: true }
-                    }
-                }
-            });
-        }
-
-        // Load mentions
-        async function loadMentions() {
-            const brand = document.getElementById('brand-filter').value;
-            
-            try {
-                const response = await fetch(`/data?brand=${brand}&per_page=50`);
-                const data = await response.json();
-                renderMentions(data.results || []);
-            } catch (error) {
-                console.error('Error loading mentions:', error);
-            }
-        }
-
-        function renderMentions(mentions) {
-            const tbody = document.getElementById('mentions-tbody');
-            
-            if (mentions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" class="loading">No mentions found</td></tr>';
-                return;
-            }
-            
-            tbody.innerHTML = mentions.map(mention => `
-                <tr>
-                    <td>${mention.type}</td>
-                    <td>r/${mention.subreddit}</td>
-                    <td>u/${mention.author}</td>
-                    <td>
-                        <div style="max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                            ${mention.title || mention.body || ''}
-                        </div>
-                        <a href="${mention.permalink}" target="_blank" style="font-size: 0.8rem; color: #667eea;">View →</a>
-                    </td>
-                    <td>${new Date(mention.created).toLocaleDateString()}</td>
-                    <td>${mention.score}</td>
-                    <td><span class="badge ${mention.sentiment || 'neutral'}">${mention.sentiment || 'neutral'}</span></td>
-                    <td>${mention.source}</td>
-                    <td>
-                        <button class="btn btn-danger" onclick="deleteMention('${mention.id}')">Delete</button>
-                    </td>
-                </tr>
-            `).join('');
-        }
-
-        // Load analytics
-        async function loadAnalytics() {
-            try {
-                const response = await fetch(`/trending_subreddits?brand=${currentBrand}`);
-                const trending = await response.json();
-                
-                const container = document.getElementById('trending-container');
-                container.innerHTML = `
-                    <table class="mentions-table">
-                        <thead>
-                            <tr>
-                                <th>Subreddit</th>
-                                <th>Mentions</th>
-                                <th>Avg Score</th>
-                                <th>Positive %</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${trending.map(item => `
-                                <tr>
-                                    <td>r/${item.subreddit}</td>
-                                    <td>${item.mention_count}</td>
-                                    <td>${item.avg_score.toFixed(1)}</td>
-                                    <td>${(item.sentiment_ratio * 100).toFixed(1)}%</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                `;
-            } catch (error) {
-                console.error('Error loading analytics:', error);
-            }
-        }
-
-        // Load system status
-        async function loadSystemStatus() {
-            try {
-                const response = await fetch('/system_status');
-                const status = await response.json();
-                
-                const container = document.getElementById('status-container');
-                container.innerHTML = `
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-number">${status.total_mentions}</div>
-                            <div class="stat-label">Total Mentions</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-number">${status.total_brands}</div>
-                            <div class="stat-label">Brands Tracked</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-number">${status.monitoring_active ? 'Active' : 'Inactive'}</div>
-                            <div class="stat-label">Monitoring Status</div>
-                        </div>
-                    </div>
-                    
-                    <h4>Data Sources</h4>
-                    <table class="mentions-table">
-                        <thead>
-                            <tr><th>Source</th><th>Total Mentions</th><th>Last Update</th></tr>
-                        </thead>
-                        <tbody>
-                            ${status.sources.map(source => `
-                                <tr>
-                                    <td>${source.source}</td>
-                                    <td>${source.count}</td>
-                                    <td>${source.last_update ? new Date(source.last_update).toLocaleString() : 'N/A'}</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                `;
-            } catch (error) {
-                console.error('Error loading system status:', error);
-            }
-        }
-
-        // Utility functions
-        async function deleteMention(id) {
-            if (!confirm('Are you sure you want to delete this mention?')) return;
-            
-            try {
-                await fetch('/delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id })
-                });
-                loadMentions();
-            } catch (error) {
-                console.error('Error deleting mention:', error);
-            }
-        }
-
-        function exportData() {
-            const brand = document.getElementById('brand-filter').value;
-            window.open(`/export?brand=${brand}`, '_blank');
-        }
-
-        // Initialize and auto-refresh
-        document.addEventListener('DOMContentLoaded', () => {
-            init();
-            setInterval(() => {
-                if (document.getElementById('dashboard-tab').style.display !== 'none') {
-                    loadDashboard();
-                }
-            }, 30000); // Refresh every 30 seconds
+    function loadData() {
+      fetch(`/data?brand=${currentBrand}`)
+        .then(res => res.json())
+        .then(data => {
+          const tbody = document.querySelector("#data-table tbody");
+          tbody.innerHTML = "";
+          data.sort((a, b) => new Date(b.created) - new Date(a.created));
+          data.forEach(item => {
+            const sentiment = item.sentiment || "neutral";
+            const badge = `<span class="badge ${sentiment}">${sentiment}</span>`;
+            const row = document.createElement("tr");
+            row.innerHTML = `
+              <td>${item.type}</td>
+              <td>${item.subreddit}</td>
+              <td>${item.author}</td>
+              <td><a href="${item.permalink}" target="_blank">View</a></td>
+              <td>${new Date(item.created).toLocaleString()}</td>
+              <td>${item.body || item.title || ""}</td>
+              <td>${badge}</td>
+              <td><button onclick="deleteEntry('${item.id}')">🗑️ Delete</button></td>`;
+            tbody.appendChild(row);
+          });
         });
-    </script>
+    }
+
+    function deleteEntry(id) {
+      if (!confirm("Are you sure you want to delete this entry?")) return;
+      fetch("/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      }).then(() => loadData());
+    }
+
+    function loadStats() {
+      const tzOffset = new Date().getTimezoneOffset();
+      fetch(`/stats?brand=badinka&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
+      fetch(`/stats?brand=iheartraves&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
+      loadWeeklyCharts();
+    }
+
+    function renderStats(data, side) {
+      const totalToday = data.daily.posts + data.daily.comments;
+      const totalAll = data.total.posts + data.total.comments;
+      const perception = data.score > 60 ? 'positive' : data.score >= 40 ? 'neutral' : 'negative';
+
+      const container = document.getElementById(`stats-${side}`);
+      container.innerHTML = `
+        <h3>${data.brand}</h3>
+        <table>
+          <tr><th colspan="2">Today</th></tr>
+          <tr><td>Posts</td><td>${data.daily.posts}</td></tr>
+          <tr><td>Comments</td><td>${data.daily.comments}</td></tr>
+          <tr><td><strong>Total Today</strong></td><td><strong>${totalToday}</strong></td></tr>
+          <tr><th colspan="2">All Time</th></tr>
+          <tr><td>Posts</td><td>${data.total.posts}</td></tr>
+          <tr><td>Comments</td><td>${data.total.comments}</td></tr>
+          <tr><td><strong>Total</strong></td><td><strong>${totalAll}</strong></td></tr>
+          <tr><th>Brand Perception Score</th><td><span class="score-label ${perception}"><strong>${data.score}/100</strong></span></td></tr>
+        </table>`;
+
+      const ctx = document.getElementById(`pie-${side}`).getContext("2d");
+      if (charts[side]) charts[side].destroy();
+      charts[side] = new Chart(ctx, {
+        type: "pie",
+        data: {
+          labels: ["Positive", "Neutral", "Negative"],
+          datasets: [{
+            data: [data.sentiment.positive, data.sentiment.neutral, data.sentiment.negative],
+            backgroundColor: ["limegreen", "gray", "red"]
+          }]
+        },
+        options: { plugins: { legend: { position: "bottom" } }, responsive: true }
+      });
+    }
+
+    function loadWeeklyCharts() {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const monday = getMonday(weekOffset);
+      updateWeekLabel(monday);
+
+      const days = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(monday);
+        d.setDate(monday.getDate() + i);
+        d.setHours(0, 0, 0, 0);
+        return d;
+      });
+
+      const labels = days.map(d => d.toLocaleDateString());
+      const keys = days.map(d => d.toLocaleDateString('en-CA'));  // en-CA = YYYY-MM-DD
+
+      Promise.all([
+        fetch(`/weekly_mentions?brand=badinka&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
+        fetch(`/weekly_mentions?brand=iheartraves&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
+      ]).then(([leftData, rightData]) => {
+        const leftValues = keys.map(key => leftData[key] || 0);
+        const rightValues = keys.map(key => rightData[key] || 0);
+        const maxY = Math.max(...leftValues, ...rightValues, 1);
+        drawBarChart("left", labels, leftValues, maxY);
+        drawBarChart("right", labels, rightValues, maxY);
+      });
+    }
+
+    function drawBarChart(side, labels, values, maxY) {
+      const ctx = document.getElementById(`bar-${side}`).getContext("2d");
+      if (barCharts[side]) barCharts[side].destroy();
+      barCharts[side] = new Chart(ctx, {
+        type: "bar",
+        data: {
+          labels: labels,
+          datasets: [{
+            label: "Mentions",
+            data: values,
+            backgroundColor: "#007bff"
+          }]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            y: { beginAtZero: true, max: maxY, title: { display: true, text: "Mentions Count" } },
+            x: { title: { display: true, text: "Date" } }
+          }
+        }
+      });
+    }
+
+    function downloadPDF() {
+      const { jsPDF } = window.jspdf;
+      html2canvas(document.querySelector("#stats-tab")).then(canvas => {
+        const doc = new jsPDF();
+        const img = canvas.toDataURL("image/png");
+        doc.addImage(img, "PNG", 0, 0, doc.internal.pageSize.getWidth(), doc.internal.pageSize.getHeight());
+        doc.save("brand-stats.pdf");
+      });
+    }
+
+    switchBrand(currentBrand);
+    setInterval(loadData, 30000);
+  </script>
 </body>
 </html>
 '''
