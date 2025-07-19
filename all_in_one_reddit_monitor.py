@@ -32,7 +32,7 @@ import csv
 import io
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -197,14 +197,21 @@ class RedditMonitor:
         
         # Initialize Reddit client
         if config['reddit']['client_id'] and config['reddit']['client_secret']:
-            self.reddit = praw.Reddit(
-                client_id=config['reddit']['client_id'],
-                client_secret=config['reddit']['client_secret'],
-                user_agent=config['reddit']['user_agent']
-            )
+            try:
+                self.reddit = praw.Reddit(
+                    client_id=config['reddit']['client_id'],
+                    client_secret=config['reddit']['client_secret'],
+                    user_agent=config['reddit']['user_agent']
+                )
+                # Test the connection
+                self.reddit.user.me()
+                logger.info("✅ PRAW Reddit client authenticated successfully")
+            except Exception as e:
+                logger.error(f"❌ PRAW authentication failed: {e}")
+                self.reddit = None
         else:
             self.reddit = None
-            logger.warning("Reddit credentials not provided - PRAW monitoring disabled")
+            logger.warning("❌ Reddit credentials not provided - PRAW monitoring disabled")
     
     def find_brands(self, text: str) -> List[str]:
         """Find brand mentions in text"""
@@ -213,6 +220,26 @@ class RedditMonitor:
             if pattern.search(text):
                 brands_found.append(brand)
         return brands_found
+    
+    def test_brand_patterns(self):
+        """Test brand patterns with sample text"""
+        test_texts = [
+            "I love badinka clothing!",
+            "Check out @badinka.com",
+            "#badinka is awesome",
+            "Devil walking is cool",
+            "devilwalking brand",
+            "devil walking fashion",
+            "This is a random text with no brands"
+        ]
+        
+        logger.info("🧪 Testing brand pattern recognition:")
+        for text in test_texts:
+            brands = self.find_brands(text)
+            if brands:
+                logger.info(f"✅ Found {brands} in: '{text}'")
+            else:
+                logger.info(f"❌ No brands in: '{text}'")
     
     async def process_mention_buffer(self):
         """Process and save mentions from buffer"""
@@ -252,7 +279,10 @@ class RedditMonitor:
                             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                                 if response.status == 200:
                                     rss_text = await response.text()
+                                    logger.debug(f"📡 Fetched RSS for r/{subreddit} - {len(rss_text)} bytes")
                                     await self._process_rss_feed(rss_text, subreddit)
+                                else:
+                                    logger.warning(f"RSS r/{subreddit} returned status {response.status}")
                     except Exception as e:
                         logger.error(f"RSS error for r/{subreddit}: {e}")
                     
@@ -272,6 +302,7 @@ class RedditMonitor:
         """Process RSS feed content"""
         try:
             feed = feedparser.parse(rss_text)
+            logger.debug(f"📊 RSS r/{subreddit}: {len(feed.entries)} entries")
             
             for entry in feed.entries:
                 if not self.running:
@@ -329,10 +360,14 @@ class RedditMonitor:
                             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                                 if response.status == 200:
                                     data = await response.json()
+                                    comment_count = len(data.get('data', {}).get('children', []))
+                                    logger.debug(f"📊 JSON API r/all: {comment_count} comments")
                                     await self._process_json_comments(data)
                                 elif response.status == 429:
                                     logger.warning("JSON API rate limited")
                                     await asyncio.sleep(60)
+                                else:
+                                    logger.warning(f"JSON API returned status {response.status}")
                     except Exception as e:
                         logger.error(f"JSON API error for r/all: {e}")
                     
@@ -421,6 +456,9 @@ class RedditMonitor:
         """Start all monitoring tasks"""
         self.running = True
         logger.info("Starting Reddit monitoring...")
+        
+        # Test brand patterns
+        self.test_brand_patterns()
         
         tasks = [
             self.monitor_rss_feeds(),
