@@ -23,7 +23,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set, Optional
 from dataclasses import dataclass, asdict
-from flask import Flask, render_template, jsonify, request, send_file
+from flask import Flask, render_template, render_template_string, jsonify, request, send_file
 import os
 from contextlib import contextmanager
 import tempfile
@@ -679,6 +679,10 @@ def delete_mention():
             return jsonify({"error": "Mention not found"}), 404
     
     return jsonify({"status": "deleted", "id": mention_id})
+
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204  # No content, prevents 404 errors
 
 # HTML Template (embedded)
 HTML_TEMPLATE = '''
