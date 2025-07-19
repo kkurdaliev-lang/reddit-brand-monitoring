@@ -405,14 +405,15 @@ class RedditMonitor:
             self.monitor_json_api()
         ]
         
-        # Add PRAW monitoring if available
+        # Start PRAW monitoring in separate thread if available
         if self.reddit:
-            tasks.append(self.monitor_praw_comments())
+            praw_thread = threading.Thread(target=self._monitor_praw_sync, daemon=True)
+            praw_thread.start()
         
         await asyncio.gather(*tasks, return_exceptions=True)
     
-    async def monitor_praw_comments(self):
-        """Monitor comments using PRAW (if available)"""
+    def _monitor_praw_sync(self):
+        """Monitor comments using PRAW in sync mode (separate thread)"""
         if not self.reddit:
             return
         
@@ -428,7 +429,7 @@ class RedditMonitor:
                         break
                     
                     if comment is None:
-                        await asyncio.sleep(1)
+                        time.sleep(1)
                         continue
                     
                     if comment.id in self.seen_ids:
@@ -458,14 +459,17 @@ class RedditMonitor:
                     
                     # Flush buffer periodically
                     if len(self.mention_buffer) >= 10:
-                        await self.process_mention_buffer()
+                        # Process buffer synchronously for thread safety
+                        if self.mention_buffer:
+                            self.db.insert_mentions(self.mention_buffer)
+                            self.mention_buffer.clear()
                 
             except prawcore.exceptions.TooManyRequests:
                 logger.warning("PRAW rate limited, sleeping 60 seconds")
-                await asyncio.sleep(60)
+                time.sleep(60)
             except Exception as e:
                 logger.error(f"PRAW monitoring error: {e}")
-                await asyncio.sleep(30)
+                time.sleep(30)
     
     def stop_monitoring(self):
         """Stop monitoring"""
