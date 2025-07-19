@@ -674,16 +674,22 @@ class RedditMonitor:
                 else:
                     sentiment = "neutral"
                 
-                # Save to database directly
-                self.db.add_mention(
-                    mention_dict['brand'],
-                    mention_dict['title'], 
-                    mention_dict['content'],
-                    mention_dict['location'],
-                    mention_dict['url'],
-                    sentiment,
-                    mention_dict['created']
+                # Create Mention object and save to database
+                mention_obj = Mention(
+                    id=f"json_{mention_dict['brand']}_{int(mention_dict['created'])}_{hash(mention_dict['content'][:50])}",
+                    type="comment",
+                    title=mention_dict['title'],
+                    body=mention_dict['content'],
+                    permalink=mention_dict['url'],
+                    created=datetime.fromtimestamp(mention_dict['created']).isoformat(),
+                    subreddit=mention_dict['location'],
+                    author=mention_dict.get('author', 'unknown'),
+                    score=mention_dict.get('score', 0),
+                    sentiment=sentiment,
+                    brand=mention_dict['brand']
                 )
+                
+                self.db.insert_mentions([mention_obj])
                 logger.info(f"✅ Saved {mention_dict['brand']} mention to database")
                 
         except Exception as e:
