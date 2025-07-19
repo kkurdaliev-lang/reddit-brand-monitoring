@@ -550,6 +550,20 @@ class RedditMonitor:
                     brands = self.find_brands(comment.body)
                     if brands:
                         for brand in brands:
+                            # Analyze sentiment IMMEDIATELY
+                            context_text = comment.body[:400]  # Focus on relevant content
+                            import asyncio
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                sentiment = loop.run_until_complete(self.sentiment.analyze(context_text))
+                                logger.info(f"💭 Analyzed sentiment for '{brand}': {sentiment}")
+                            except Exception as e:
+                                sentiment = "neutral"
+                                logger.warning(f"Sentiment analysis failed for {brand}: {e}")
+                            finally:
+                                loop.close()
+                            
                             mention = Mention(
                                 id=comment.id,
                                 type="comment",
@@ -560,14 +574,15 @@ class RedditMonitor:
                                 subreddit=str(comment.subreddit),
                                 author=str(comment.author),
                                 score=comment.score,
-                                sentiment=None,
+                                sentiment=sentiment,  # Set analyzed sentiment
                                 brand=brand,
                                 source="praw"
                             )
                             
-                            self.mention_buffer.append(mention)
+                            # Save to database IMMEDIATELY
+                            self.db.insert_mentions([mention])
                             self.seen_ids.add(comment.id)
-                            logger.info(f"Found PRAW mention: {brand} in r/{comment.subreddit}")
+                            logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -624,6 +639,20 @@ class RedditMonitor:
                     
                     if brands:
                         for brand in brands:
+                            # Analyze sentiment IMMEDIATELY
+                            context_text = full_text[:400]  # Focus on relevant content
+                            import asyncio
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                sentiment = loop.run_until_complete(self.sentiment.analyze(context_text))
+                                logger.info(f"💭 Analyzed post sentiment for '{brand}': {sentiment}")
+                            except Exception as e:
+                                sentiment = "neutral"
+                                logger.warning(f"Post sentiment analysis failed for {brand}: {e}")
+                            finally:
+                                loop.close()
+                            
                             mention = Mention(
                                 id=post.id,
                                 type="post",
@@ -634,14 +663,15 @@ class RedditMonitor:
                                 subreddit=str(post.subreddit),
                                 author=str(post.author),
                                 score=post.score,
-                                sentiment=None,
+                                sentiment=sentiment,  # Set analyzed sentiment
                                 brand=brand,
                                 source="praw"
                             )
                             
-                            self.mention_buffer.append(mention)
+                            # Save to database IMMEDIATELY
+                            self.db.insert_mentions([mention])
                             self.seen_ids.add(post.id)
-                            logger.info(f"🎉 Found PRAW post mention: {brand} in r/{post.subreddit}")
+                            logger.info(f"✅ Saved PRAW post mention: {brand} in r/{post.subreddit} with sentiment: {sentiment}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -884,25 +914,40 @@ class RedditMonitor:
                             # Check for brand mentions
                             for brand_name, brand_pattern in self.brands.items():
                                 if brand_pattern.search(body):
-                                    # Extract context around the mention (simple version for JSON)
+                                    # Analyze sentiment IMMEDIATELY
                                     context = self._extract_simple_context(body, brand_name)
+                                    import asyncio
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        sentiment = loop.run_until_complete(self.sentiment.analyze(context))
+                                        logger.info(f"💭 Analyzed JSON sentiment for '{brand_name}': {sentiment}")
+                                    except Exception as e:
+                                        sentiment = "neutral"
+                                        logger.warning(f"JSON sentiment analysis failed for {brand_name}: {e}")
+                                    finally:
+                                        loop.close()
                                     
-                                    # Add to mention buffer for sentiment analysis
-                                    mention_data = {
-                                        'brand': brand_name,
-                                        'title': f"Comment in r/{c.get('subreddit', 'unknown')}",
-                                        'content': body,
-                                        'context': context,
-                                        'location': f"r/{c.get('subreddit', 'unknown')}",
-                                        'url': f"https://reddit.com{c.get('permalink', '')}",
-                                        'created': c.get('created_utc', time.time()),
-                                        'author': c.get('author', 'unknown'),
-                                        'score': c.get('score', 0)
-                                    }
+                                    # Create Mention object and save IMMEDIATELY
+                                    mention_obj = Mention(
+                                        id=f"json_{brand_name}_{int(c.get('created_utc', time.time()))}_{hash(body[:50])}",
+                                        type="comment",
+                                        title=f"Comment in r/{c.get('subreddit', 'unknown')}",
+                                        body=body,
+                                        permalink=f"https://reddit.com{c.get('permalink', '')}",
+                                        created=datetime.fromtimestamp(c.get('created_utc', time.time())).isoformat(),
+                                        subreddit=f"r/{c.get('subreddit', 'unknown')}",
+                                        author=c.get('author', 'unknown'),
+                                        score=c.get('score', 0),
+                                        sentiment=sentiment,  # Set analyzed sentiment
+                                        brand=brand_name,
+                                        source="json_chunked_monitoring"
+                                    )
                                     
-                                    self.json_mention_buffer.append(mention_data)
+                                    # Save to database IMMEDIATELY
+                                    self.db.insert_mentions([mention_obj])
                                     seen_json_ids.add(cid)
-                                    logger.info(f"🎯 Found {brand_name} mention in r/{c.get('subreddit')}")
+                                    logger.info(f"✅ Saved JSON mention: {brand_name} in r/{c.get('subreddit')} with sentiment: {sentiment}")
                     
                     except requests.exceptions.ConnectionError as e:
                         logger.warning(f"❌ Connection error for chunk {chunk_str}: {e}")
