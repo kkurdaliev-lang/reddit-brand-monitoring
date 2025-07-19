@@ -152,6 +152,25 @@ class DatabaseManager:
             cursor = conn.execute("SELECT id FROM mentions")
             return set(row[0] for row in cursor.fetchall())
     
+    def get_core_reddit_ids(self) -> Set[str]:
+        """Extract core Reddit IDs from various formats to prevent duplicates"""
+        with self.get_connection() as conn:
+            cursor = conn.execute("SELECT id FROM mentions")
+            core_ids = set()
+            for row in cursor.fetchall():
+                raw_id = row[0]
+                # Extract core Reddit ID from different formats
+                if raw_id.startswith('json_'):
+                    # Handle old format: json_n3z93h6_badinka -> n3z93h6
+                    parts = raw_id.split('_')
+                    if len(parts) >= 2:
+                        core_id = parts[1]  # Extract the Reddit ID part
+                        core_ids.add(core_id)
+                else:
+                    # Handle direct Reddit IDs: n3z93h6 -> n3z93h6
+                    core_ids.add(raw_id)
+            return core_ids
+    
     def get_existing_content_hashes(self) -> Set[str]:
         """Get set of content hashes to detect duplicates by content"""
         with self.get_connection() as conn:
@@ -167,7 +186,7 @@ class DatabaseManager:
 class SentimentAnalyzer:
     def __init__(self, api_token: str):
         self.api_token = api_token
-        self.api_url = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
+        self.api_url = "https://api-inference.huggingface.co/models/tabularisai/multilingual-sentiment-analysis"
         logger.info(f"🤖 Sentiment analyzer initialized with URL: {self.api_url}")
         self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
     
@@ -240,11 +259,15 @@ class RedditMonitor:
         }
         self.sentiment = SentimentAnalyzer(config['hf_api_token'])
         self.seen_ids = self.db.get_existing_ids()
+        self.seen_core_ids = self.db.get_core_reddit_ids()  # For handling mixed ID formats
         self.seen_content = self.db.get_existing_content_hashes()
         logger.info(f"🔍 Loaded {len(self.seen_ids)} existing IDs to prevent duplicates")
+        logger.info(f"🔍 Loaded {len(self.seen_core_ids)} core Reddit IDs to prevent duplicates")
         logger.info(f"🔍 Loaded {len(self.seen_content)} existing content hashes to prevent duplicates")
         if self.seen_ids:
             logger.info(f"🔍 Sample existing IDs: {list(self.seen_ids)[:3]}")  # Show first 3 IDs
+        if self.seen_core_ids:
+            logger.info(f"🔍 Sample core IDs: {list(self.seen_core_ids)[:3]}")  # Show first 3 core IDs
         self.mention_buffer: List[Mention] = []  # For PRAW mention objects
         self.json_mention_buffer = []  # For JSON mention dictionaries
         self.running = False
@@ -626,17 +649,22 @@ class RedditMonitor:
                                 source="praw"
                             )
                             
-                            # Check for duplicates using both ID and content
+                            # Check for duplicates using ID, core ID, and content
                             content_hash = f"{brand}_{str(comment.subreddit)}_{hash(comment.body[:100])}"
                             
-                            if comment.id not in self.seen_ids and content_hash not in self.seen_content:
+                            is_duplicate = (comment.id in self.seen_ids or 
+                                          comment.id in self.seen_core_ids or 
+                                          content_hash in self.seen_content)
+                            
+                            if not is_duplicate:
                                 # Save to database IMMEDIATELY
                                 self.db.insert_mentions([mention])
                                 self.seen_ids.add(comment.id)
+                                self.seen_core_ids.add(comment.id)
                                 self.seen_content.add(content_hash)
                                 logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment} (ID: {comment.id})")
                             else:
-                                logger.info(f"⏭️ Skipped duplicate: ID={comment.id in self.seen_ids}, Content={content_hash in self.seen_content} for brand {brand}")
+                                logger.info(f"⏭️ Skipped duplicate: ID={comment.id in self.seen_ids}, CoreID={comment.id in self.seen_core_ids}, Content={content_hash in self.seen_content} for brand {brand}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -726,17 +754,22 @@ class RedditMonitor:
                                 source="praw"
                             )
                             
-                            # Check for duplicates using both ID and content
+                            # Check for duplicates using ID, core ID, and content
                             content_hash = f"{brand}_{str(post.subreddit)}_{hash(full_text[:100])}"
                             
-                            if post.id not in self.seen_ids and content_hash not in self.seen_content:
+                            is_duplicate = (post.id in self.seen_ids or 
+                                          post.id in self.seen_core_ids or 
+                                          content_hash in self.seen_content)
+                            
+                            if not is_duplicate:
                                 # Save to database IMMEDIATELY
                                 self.db.insert_mentions([mention])
                                 self.seen_ids.add(post.id)
+                                self.seen_core_ids.add(post.id)
                                 self.seen_content.add(content_hash)
                                 logger.info(f"✅ Saved PRAW post mention: {brand} in r/{post.subreddit} with sentiment: {sentiment}")
                             else:
-                                logger.info(f"⏭️ Skipped duplicate post: ID={post.id in self.seen_ids}, Content={content_hash in self.seen_content} for brand {brand}")
+                                logger.info(f"⏭️ Skipped duplicate post: ID={post.id in self.seen_ids}, CoreID={post.id in self.seen_core_ids}, Content={content_hash in self.seen_content} for brand {brand}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -1003,8 +1036,12 @@ class RedditMonitor:
                                     # Check for duplicates using both ID and content  
                                     content_hash = f"{brand_name}_{c.get('subreddit', 'unknown')}_{hash(body[:100])}"
                                     
-                                    if mention_id in self.seen_ids or content_hash in self.seen_content:
-                                        logger.debug(f"⏭️ Skipped duplicate JSON mention: ID={mention_id in self.seen_ids}, Content={content_hash in self.seen_content}")
+                                    is_duplicate = (mention_id in self.seen_ids or 
+                                                   mention_id in self.seen_core_ids or 
+                                                   content_hash in self.seen_content)
+                                    
+                                    if is_duplicate:
+                                        logger.debug(f"⏭️ Skipped duplicate JSON mention: ID={mention_id in self.seen_ids}, CoreID={mention_id in self.seen_core_ids}, Content={content_hash in self.seen_content}")
                                         continue
                                     
                                     # Create Mention object and save IMMEDIATELY
@@ -1026,6 +1063,7 @@ class RedditMonitor:
                                     # Save to database IMMEDIATELY
                                     self.db.insert_mentions([mention_obj])
                                     self.seen_ids.add(mention_id)  # Add to seen_ids to prevent duplicates
+                                    self.seen_core_ids.add(mention_id)  # Add to seen_core_ids to prevent duplicates
                                     self.seen_content.add(content_hash)  # Add to seen_content to prevent duplicates
                                     seen_json_ids.add(cid)
                                     logger.info(f"✅ Saved JSON mention: {brand_name} in r/{c.get('subreddit')} with sentiment: {sentiment}")
