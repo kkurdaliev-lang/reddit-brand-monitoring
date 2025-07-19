@@ -32,7 +32,7 @@ import csv
 import io
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -461,8 +461,9 @@ class RedditMonitor:
         self.test_brand_patterns()
         
         tasks = [
-            self.monitor_rss_feeds(),
-            self.monitor_json_api(),
+            # RSS and JSON API are getting 403 errors, but PRAW is working perfectly
+            # self.monitor_rss_feeds(),
+            # self.monitor_json_api(),
             self.monitor_focused_subreddits()  # Additional focused monitoring
         ]
         
@@ -499,6 +500,15 @@ class RedditMonitor:
                     
                     if comment.id in self.seen_ids:
                         continue
+                    
+                    # Debug: Log every 100th comment to see what we're processing
+                    if hasattr(self, '_comment_count'):
+                        self._comment_count += 1
+                    else:
+                        self._comment_count = 1
+                    
+                    if self._comment_count % 100 == 0:
+                        logger.info(f"🔍 Processed {self._comment_count} comments, checking: '{comment.body[:50]}...'")
                     
                     brands = self.find_brands(comment.body)
                     if brands:
