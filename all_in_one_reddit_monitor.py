@@ -152,7 +152,7 @@ class DatabaseManager:
 class SentimentAnalyzer:
     def __init__(self, api_token: str):
         self.api_token = api_token
-        self.api_url = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
+        self.api_url = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment"
         self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
     
     async def analyze(self, context_text: str) -> str:
