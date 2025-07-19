@@ -501,13 +501,17 @@ class RedditMonitor:
         # Start both comment and post monitoring in separate threads
         comment_thread = threading.Thread(target=self._monitor_praw_comments, daemon=True)
         post_thread = threading.Thread(target=self._monitor_praw_posts, daemon=True)
+        json_thread = threading.Thread(target=self._monitor_json_comments_chunked, daemon=True)
         
         comment_thread.start()
         post_thread.start()
+        json_thread.start()
+        logger.info("✅ Started enhanced JSON comment monitoring with chunking")
         
         # Wait for threads to complete
         comment_thread.join()
         post_thread.join()
+        json_thread.join()
     
     def _monitor_praw_comments(self):
         """Monitor comments using PRAW"""
@@ -768,22 +772,98 @@ class RedditMonitor:
         except Exception as e:
             logger.error(f"Error monitoring r/{subreddit} posts: {e}")
     
-    async def _monitor_subreddit_comments(self, subreddit: str):
-        """Monitor comments in a specific subreddit"""
-        try:
-            url = f"https://www.reddit.com/r/{subreddit}/comments.json?limit=25"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        await self._process_json_comments(data)
-                    elif response.status == 429:
-                        logger.warning(f"Rate limited for r/{subreddit}")
-                        await asyncio.sleep(30)
+    def _monitor_json_comments_chunked(self):
+        """Enhanced JSON comment monitoring with chunking and robust error handling"""
+        logger.info("📡 Enhanced JSON comment poller started...")
+        import requests
+        import random
+        
+        session = requests.Session()
+        session.headers.update({"User-Agent": "BrandMentionMonitor/1.0 by AllInOneRedditMonitor"})
+        seen_json_ids = set()
+        chunk_size = 5  # Process subreddits in chunks
+        base_delay = 15
+        
+        subreddits = self.config.get('focused_subreddits', [])
+        
+        while self.running:
+            try:
+                for i in range(0, len(subreddits), chunk_size):
+                    if not self.running:
+                        break
                         
-        except Exception as e:
-            logger.error(f"Error monitoring r/{subreddit} comments: {e}")
+                    chunk = subreddits[i:i + chunk_size]
+                    chunk_str = "+".join(chunk)
+                    url = f"https://www.reddit.com/r/{chunk_str}/comments.json?limit=100"
+                    
+                    try:
+                        response = session.get(url, timeout=10)
+                        if response.status_code == 429:
+                            logger.warning(f"❌ 429 Too Many Requests on chunk: {chunk_str}")
+                            time.sleep(30)
+                            continue
+                        response.raise_for_status()
+                        
+                        data = response.json()
+                        children = data.get("data", {}).get("children", [])
+                        
+                        for item in children:
+                            if not self.running:
+                                break
+                                
+                            c = item.get("data", {})
+                            cid = c.get("id")
+                            if not c or cid in seen_json_ids:
+                                continue
+                                
+                            body = c.get("body", "")
+                            if len(body) < 20:
+                                continue
+                            
+                            # Check for brand mentions
+                            for brand_name, brand_pattern in self.brands.items():
+                                if brand_pattern.search(body):
+                                    # Extract context around the mention
+                                    context = self._extract_context(body, brand_name)
+                                    
+                                    # Add to mention buffer for sentiment analysis
+                                    mention_data = {
+                                        'brand': brand_name,
+                                        'title': f"Comment in r/{c.get('subreddit', 'unknown')}",
+                                        'content': body,
+                                        'context': context,
+                                        'location': f"r/{c.get('subreddit', 'unknown')}",
+                                        'url': f"https://reddit.com{c.get('permalink', '')}",
+                                        'created': c.get('created_utc', time.time()),
+                                        'author': c.get('author', 'unknown'),
+                                        'score': c.get('score', 0)
+                                    }
+                                    
+                                    self.mention_buffer.append(mention_data)
+                                    seen_json_ids.add(cid)
+                                    logger.info(f"🎯 Found {brand_name} mention in r/{c.get('subreddit')}")
+                    
+                    except requests.exceptions.ConnectionError as e:
+                        logger.warning(f"❌ Connection error for chunk {chunk_str}: {e}")
+                        backoff = random.randint(20, 40)
+                        logger.info(f"⏳ Backing off for {backoff} seconds...")
+                        time.sleep(backoff)
+                    except requests.exceptions.HTTPError as e:
+                        if response.status_code >= 500:
+                            logger.warning(f"❌ 5xx server error for chunk {chunk_str}: {e}")
+                            backoff = random.randint(25, 60)
+                            logger.info(f"⏳ Backing off for {backoff} seconds...")
+                            time.sleep(backoff)
+                        else:
+                            logger.error(f"❌ HTTP error on chunk {chunk_str}: {e}")
+                    except Exception as e:
+                        logger.error(f"❌ Unknown error on chunk {chunk_str}: {e}")
+                    
+                    time.sleep(base_delay)
+                    
+            except Exception as e:
+                logger.error(f"JSON comment monitoring error: {e}")
+                time.sleep(60)  # Wait before retrying
     
     async def _process_subreddit_posts(self, data: dict, subreddit: str):
         """Process posts from focused subreddit monitoring"""
