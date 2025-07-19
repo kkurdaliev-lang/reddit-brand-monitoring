@@ -568,10 +568,11 @@ class RedditMonitor:
                             self.seen_ids.add(comment.id)
                             logger.info(f"Found PRAW mention: {brand} in r/{comment.subreddit}")
                     
-                    # Flush buffer periodically
-                    if len(self.mention_buffer) >= 10:
+                    # Flush buffer more frequently for immediate processing
+                    if len(self.mention_buffer) >= 1:  # Process immediately
                         # Process buffer with sentiment analysis
                         if self.mention_buffer:
+                            logger.info(f"💾 Processing {len(self.mention_buffer)} PRAW mentions from buffer...")
                             self._process_praw_buffer_with_sentiment()
                             self.mention_buffer.clear()
                 
@@ -641,10 +642,11 @@ class RedditMonitor:
                             self.seen_ids.add(post.id)
                             logger.info(f"🎉 Found PRAW post mention: {brand} in r/{post.subreddit}")
                     
-                    # Flush buffer periodically
-                    if len(self.mention_buffer) >= 10:
+                    # Flush buffer more frequently for immediate processing
+                    if len(self.mention_buffer) >= 1:  # Process immediately
                         # Process buffer with sentiment analysis
                         if self.mention_buffer:
+                            logger.info(f"💾 Processing {len(self.mention_buffer)} PRAW post mentions from buffer...")
                             self._process_praw_buffer_with_sentiment()
                             self.mention_buffer.clear()
                 
