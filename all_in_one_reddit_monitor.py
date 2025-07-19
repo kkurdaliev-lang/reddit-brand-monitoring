@@ -1132,6 +1132,60 @@ def download_csv():
     
     return response
 
+@app.route('/backfill/<subreddit>')
+def backfill_subreddit(subreddit):
+    """Manually backfill recent mentions from a specific subreddit"""
+    try:
+        # Get recent posts from the subreddit (last 25 posts)
+        import praw
+        
+        reddit = praw.Reddit(
+            client_id=CONFIG['reddit']['client_id'],
+            client_secret=CONFIG['reddit']['client_secret'],
+            user_agent=CONFIG['reddit']['user_agent']
+        )
+        
+        found_mentions = 0
+        processed = 0
+        
+        # Check recent posts
+        for submission in reddit.subreddit(subreddit).new(limit=25):
+            processed += 1
+            # Check if this post contains brand mentions
+            for brand_name, brand_pattern in CONFIG['brands'].items():
+                title_text = f"{submission.title} {submission.selftext}"
+                if brand_pattern.search(title_text):
+                    # This is a brand mention - save it
+                    db_manager.add_mention(
+                        brand_name, submission.title, title_text[:500], 
+                        f"r/{subreddit}", f"https://reddit.com{submission.permalink}",
+                        "neutral", submission.created_utc
+                    )
+                    found_mentions += 1
+                    
+            # Check recent comments on this post
+            submission.comments.replace_more(limit=0)
+            for comment in submission.comments.list()[:10]:  # Latest 10 comments
+                for brand_name, brand_pattern in CONFIG['brands'].items():
+                    if brand_pattern.search(comment.body):
+                        db_manager.add_mention(
+                            brand_name, f"Comment on: {submission.title}", 
+                            comment.body[:500], f"r/{subreddit}",
+                            f"https://reddit.com{comment.permalink}",
+                            "neutral", comment.created_utc
+                        )
+                        found_mentions += 1
+        
+        return jsonify({
+            "status": "success",
+            "processed": processed,
+            "found_mentions": found_mentions,
+            "subreddit": subreddit
+        })
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
 @app.route('/weekly_mentions')
 def weekly_mentions():
     """Get weekly mention counts for charts"""
