@@ -835,6 +835,16 @@ app = Flask(__name__)
 db_manager = None
 reddit_monitor = None
 
+@app.route('/debug-info')
+def debug_info():
+    """Debug route to test if new routes are working"""
+    return jsonify({
+        "status": "SUCCESS - New routes are working!",
+        "timestamp": datetime.utcnow().isoformat(),
+        "message": "If you can see this, the deployment picked up our changes",
+        "backfill_available": True
+    })
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -1529,7 +1539,7 @@ def run_monitoring_thread():
 def main():
     global db_manager, reddit_monitor
     
-    print("🚀 Starting All-in-One Reddit Brand Monitor...")
+    print("🚀 Starting All-in-One Reddit Brand Monitor v2.0 - WITH BACKFILL FEATURE...")
     print(f"🔧 Python version: {os.sys.version}")
     print(f"🔧 Working directory: {os.getcwd()}")
     print(f"🔧 PORT environment variable: {os.getenv('PORT', 'Not set')}")
