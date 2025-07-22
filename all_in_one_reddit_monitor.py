@@ -615,7 +615,7 @@ class RedditMonitor:
                         self._comment_count = 1
                     
                     if self._comment_count % 100 == 0:
-                        logger.info(f"🔍 Processed {self._comment_count} comments, checking: '{comment.body[:50]}...'")
+                        logger.debug(f"🔍 Processed {self._comment_count} comments, checking: '{comment.body[:50]}...'")
                     
                     brands = self.find_brands(comment.body)
                     if brands:
@@ -717,7 +717,7 @@ class RedditMonitor:
                         self._post_count = 1
                     
                     if self._post_count % 50 == 0:
-                        logger.info(f"📝 Processed {self._post_count} posts, checking: '{post.title[:50]}...'")
+                        logger.debug(f"📝 Processed {self._post_count} posts, checking: '{post.title[:50]}...'")
                     
                     # Check both title and selftext for brand mentions
                     full_text = f"{post.title} {post.selftext}"
