@@ -272,6 +272,12 @@ class RedditMonitor:
         self.json_mention_buffer = []  # For JSON mention dictionaries
         self.running = False
         
+        # Backfill tracking for intelligent gap filling
+        self.last_comment_rate_limit = None
+        self.last_post_rate_limit = None
+        self.comment_rate_limit_start = None
+        self.post_rate_limit_start = None
+        
         # Initialize Reddit client
         if config['reddit']['client_id'] and config['reddit']['client_secret']:
             try:
@@ -560,17 +566,25 @@ class RedditMonitor:
         if not self.reddit:
             return
         
-        logger.info("Starting PRAW monitoring...")
+        logger.info("Starting PRAW monitoring with staggered timing...")
         
-        # Start both comment and post monitoring in separate threads
+        # Start comment monitoring immediately
         comment_thread = threading.Thread(target=self._monitor_praw_comments, daemon=True)
-        post_thread = threading.Thread(target=self._monitor_praw_posts, daemon=True)
-        json_thread = threading.Thread(target=self._monitor_json_comments_chunked, daemon=True)
-        
         comment_thread.start()
-        post_thread.start()
+        logger.info("✅ Started PRAW comment monitoring")
+        
+        # Start JSON monitoring immediately (different endpoint, less conflicts)
+        json_thread = threading.Thread(target=self._monitor_json_comments_chunked, daemon=True)
         json_thread.start()
         logger.info("✅ Started enhanced JSON comment monitoring with chunking")
+        
+        # STAGGERED: Wait 30 seconds before starting post monitoring to offset rate limits
+        logger.info("⏳ Waiting 30 seconds before starting post monitoring (staggered approach)...")
+        time.sleep(30)
+        
+        post_thread = threading.Thread(target=self._monitor_praw_posts, daemon=True)
+        post_thread.start()
+        logger.info("✅ Started PRAW post monitoring (staggered)")
         
         # Wait for threads to complete
         comment_thread.join()
@@ -593,7 +607,7 @@ class RedditMonitor:
                 else:
                     subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
                 # Use skip_existing=True but also manually track to ensure no duplicates
-                comment_stream = subreddit.stream.comments(skip_existing=True, pause_after=5)
+                comment_stream = subreddit.stream.comments(skip_existing=True, pause_after=10)
                 logger.info(f"🎯 Starting comment stream for {subreddit} (skip_existing=True)")
                 
                 for comment in comment_stream:
@@ -601,7 +615,7 @@ class RedditMonitor:
                         break
                     
                     if comment is None:
-                        time.sleep(1)
+                        time.sleep(1.5)  # Slightly longer pause to reduce rate limiting
                         continue
                     
                     if comment.id in self.seen_ids:
@@ -675,8 +689,20 @@ class RedditMonitor:
                             self.mention_buffer.clear()
                 
             except prawcore.exceptions.TooManyRequests:
+                # Track rate limit period for backfill
+                self.comment_rate_limit_start = datetime.now(timezone.utc)
                 logger.warning("PRAW rate limited, sleeping 60 seconds")
                 time.sleep(60)
+                
+                # After rate limit ends, trigger backfill
+                rate_limit_end = datetime.now(timezone.utc)
+                if self.comment_rate_limit_start:
+                    logger.info("🔄 Rate limit ended, starting comment backfill...")
+                    threading.Thread(
+                        target=self._backfill_missed_content,
+                        args=("comments", self.comment_rate_limit_start, rate_limit_end),
+                        daemon=True
+                    ).start()
             except Exception as e:
                 logger.error(f"PRAW comment monitoring error: {e}")
                 time.sleep(30)
@@ -697,14 +723,14 @@ class RedditMonitor:
                 else:
                     subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
                 
-                post_stream = subreddit.stream.submissions(skip_existing=True, pause_after=5)
+                post_stream = subreddit.stream.submissions(skip_existing=True, pause_after=10)
                 
                 for post in post_stream:
                     if not self.running:
                         break
                     
                     if post is None:
-                        time.sleep(1)
+                        time.sleep(1.5)  # Slightly longer pause to reduce rate limiting
                         continue
                     
                     if post.id in self.seen_ids:
@@ -780,8 +806,20 @@ class RedditMonitor:
                             self.mention_buffer.clear()
                 
             except prawcore.exceptions.TooManyRequests:
+                # Track rate limit period for backfill
+                self.post_rate_limit_start = datetime.now(timezone.utc)
                 logger.warning("PRAW posts rate limited, sleeping 60 seconds")
                 time.sleep(60)
+                
+                # After rate limit ends, trigger backfill
+                rate_limit_end = datetime.now(timezone.utc)
+                if self.post_rate_limit_start:
+                    logger.info("🔄 Rate limit ended, starting post backfill...")
+                    threading.Thread(
+                        target=self._backfill_missed_content,
+                        args=("posts", self.post_rate_limit_start, rate_limit_end),
+                        daemon=True
+                    ).start()
             except Exception as e:
                 logger.error(f"PRAW post monitoring error: {e}")
                 time.sleep(30)
@@ -915,6 +953,108 @@ class RedditMonitor:
         
         logger.debug(f"📝 Brand context for '{brand_name}': '{context[:100]}...'")
         return context
+    
+    def _backfill_missed_content(self, content_type: str, gap_start: datetime, gap_end: datetime):
+        """Intelligent backfill to catch content missed during rate limit periods"""
+        try:
+            logger.info(f"🔄 Starting backfill for {content_type} from {gap_start} to {gap_end}")
+            
+            # Calculate gap duration
+            gap_duration = (gap_end - gap_start).total_seconds()
+            if gap_duration < 30:  # Don't backfill very short gaps
+                logger.info(f"⏭️ Skipping backfill - gap too short ({gap_duration}s)")
+                return
+            
+            # Use JSON API for backfill (more reliable than PRAW for historical data)
+            if content_type == "comments":
+                self._backfill_comments_json(gap_start, gap_end)
+            elif content_type == "posts":
+                self._backfill_posts_json(gap_start, gap_end)
+                
+        except Exception as e:
+            logger.error(f"❌ Backfill error for {content_type}: {e}")
+    
+    def _backfill_comments_json(self, gap_start: datetime, gap_end: datetime):
+        """Backfill comments using JSON API"""
+        try:
+            # Use focused subreddits for backfill to reduce load
+            subreddits_to_check = self.config.get('focused_subreddits', [])[:5]  # Limit to top 5
+            
+            for subreddit in subreddits_to_check:
+                url = f"https://www.reddit.com/r/{subreddit}/comments.json?limit=100&sort=new"
+                
+                try:
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        comments_found = 0
+                        
+                        for item in data.get('data', {}).get('children', []):
+                            comment_data = item.get('data', {})
+                            created_time = datetime.fromtimestamp(comment_data.get('created_utc', 0), tz=timezone.utc)
+                            
+                            # Check if comment falls within gap period
+                            if gap_start <= created_time <= gap_end:
+                                comment_body = comment_data.get('body', '')
+                                brands = self.find_brands(comment_body)
+                                
+                                if brands:
+                                    comments_found += 1
+                                    # Process as normal mention
+                                    for brand in brands:
+                                        logger.info(f"🔄 Backfilled comment mention: {brand} in r/{subreddit}")
+                        
+                        if comments_found > 0:
+                            logger.info(f"✅ Backfilled {comments_found} comments from r/{subreddit}")
+                            
+                except Exception as e:
+                    logger.error(f"❌ Backfill error for r/{subreddit} comments: {e}")
+                    
+                time.sleep(1)  # Rate limiting for backfill
+                
+        except Exception as e:
+            logger.error(f"❌ Comment backfill error: {e}")
+    
+    def _backfill_posts_json(self, gap_start: datetime, gap_end: datetime):
+        """Backfill posts using JSON API"""
+        try:
+            # Use focused subreddits for backfill
+            subreddits_to_check = self.config.get('focused_subreddits', [])[:5]  # Limit to top 5
+            
+            for subreddit in subreddits_to_check:
+                url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=100"
+                
+                try:
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        posts_found = 0
+                        
+                        for item in data.get('data', {}).get('children', []):
+                            post_data = item.get('data', {})
+                            created_time = datetime.fromtimestamp(post_data.get('created_utc', 0), tz=timezone.utc)
+                            
+                            # Check if post falls within gap period
+                            if gap_start <= created_time <= gap_end:
+                                full_text = f"{post_data.get('title', '')} {post_data.get('selftext', '')}"
+                                brands = self.find_brands(full_text)
+                                
+                                if brands:
+                                    posts_found += 1
+                                    # Process as normal mention
+                                    for brand in brands:
+                                        logger.info(f"🔄 Backfilled post mention: {brand} in r/{subreddit}")
+                        
+                        if posts_found > 0:
+                            logger.info(f"✅ Backfilled {posts_found} posts from r/{subreddit}")
+                            
+                except Exception as e:
+                    logger.error(f"❌ Backfill error for r/{subreddit} posts: {e}")
+                    
+                time.sleep(1)  # Rate limiting for backfill
+                
+        except Exception as e:
+            logger.error(f"❌ Post backfill error: {e}")
      
     async def monitor_focused_subreddits(self):
         """Monitor high-priority subreddits for extra coverage"""
