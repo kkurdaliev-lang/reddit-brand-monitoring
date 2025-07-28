@@ -190,7 +190,7 @@ class SentimentAnalyzer:
         logger.info(f"🤖 Sentiment analyzer initialized with URL: {self.api_url}")
         self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
     
-    async def analyze(self, context_text: str) -> str:
+    def analyze(self, context_text: str) -> str:
         """Analyze sentiment of brand-focused context text"""
         logger.info(f"🔍 Starting sentiment analysis for text: '{context_text[:100]}...'")
         
@@ -203,44 +203,42 @@ class SentimentAnalyzer:
             return "neutral"
         
         try:
-            async with aiohttp.ClientSession() as session:
-                # Limit text length for API efficiency (focus on most relevant part)
-                focused_text = context_text[:400]  # Slightly shorter for better focus
-                payload = {"inputs": focused_text}
+            # Limit text length for API efficiency (focus on most relevant part)
+            focused_text = context_text[:400]  # Slightly shorter for better focus
+            payload = {"inputs": focused_text}
+            
+            logger.info(f"📡 Sending request to: {self.api_url}")
+            logger.info(f"📦 Payload: {payload}")
+            logger.info(f"🔑 Headers: {self.headers}")
+            
+            response = requests.post(self.api_url, headers=self.headers, json=payload, timeout=10)
+            logger.info(f"📊 Response status: {response.status_code}")
+            logger.info(f"📄 Response body: {response.text}")
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"✅ Parsed JSON result: {result}")
                 
-                logger.info(f"📡 Sending request to: {self.api_url}")
-                logger.info(f"📦 Payload: {payload}")
-                logger.info(f"🔑 Headers: {self.headers}")
-                
-                async with session.post(self.api_url, headers=self.headers, json=payload) as response:
-                    logger.info(f"📊 Response status: {response.status}")
-                    response_text = await response.text()
-                    logger.info(f"📄 Response body: {response_text}")
+                if result and isinstance(result, list) and result[0]:
+                    scores = result[0]
+                    best_score = max(scores, key=lambda x: x['score'])
+                    label = best_score['label'].lower()
+                    confidence = best_score['score']
                     
-                    if response.status == 200:
-                        result = await response.json()
-                        logger.info(f"✅ Parsed JSON result: {result}")
-                        
-                        if result and isinstance(result, list) and result[0]:
-                            scores = result[0]
-                            best_score = max(scores, key=lambda x: x['score'])
-                            label = best_score['label'].lower()
-                            confidence = best_score['score']
-                            
-                            logger.info(f"🏆 Best score: {best_score}")
-                            
-                            # Map labels to our sentiment system
-                            if 'positive' in label:
-                                sentiment = 'positive'
-                            elif 'negative' in label:
-                                sentiment = 'negative'
-                            else:
-                                sentiment = 'neutral'
-                            
-                            logger.info(f"🎯 Final sentiment: {sentiment} (confidence: {confidence:.2f})")
-                            return sentiment
+                    logger.info(f"🏆 Best score: {best_score}")
+                    
+                    # Map labels to our sentiment system
+                    if 'positive' in label:
+                        sentiment = 'positive'
+                    elif 'negative' in label:
+                        sentiment = 'negative'
                     else:
-                        logger.error(f"❌ HuggingFace API returned status {response.status}: {response_text}")
+                        sentiment = 'neutral'
+                    
+                    logger.info(f"🎯 Final sentiment: {sentiment} (confidence: {confidence:.2f})")
+                    return sentiment
+            else:
+                logger.error(f"❌ HuggingFace API returned status {response.status_code}: {response.text}")
         except Exception as e:
             logger.error(f"💥 Sentiment analysis error: {e}")
             import traceback
@@ -334,7 +332,7 @@ class RedditMonitor:
                 # Extract context around the brand mention for focused sentiment analysis
                 context_text = self._extract_brand_context(mention)
                 if context_text:
-                    mention.sentiment = await self.sentiment.analyze(context_text)
+                    mention.sentiment = self.sentiment.analyze(context_text)
                     logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
                 else:
                     mention.sentiment = "neutral"  # Fallback if no context found
@@ -362,14 +360,13 @@ class RedditMonitor:
                     url = f"https://www.reddit.com/r/{subreddit}/new/.rss"
                     
                     try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                                if response.status == 200:
-                                    rss_text = await response.text()
-                                    logger.debug(f"📡 Fetched RSS for r/{subreddit} - {len(rss_text)} bytes")
-                                    await self._process_rss_feed(rss_text, subreddit)
-                                else:
-                                    logger.warning(f"RSS r/{subreddit} returned status {response.status}")
+                        response = requests.get(url, timeout=10)
+                        if response.status_code == 200:
+                            rss_text = response.text
+                            logger.debug(f"📡 Fetched RSS for r/{subreddit} - {len(rss_text)} bytes")
+                            await self._process_rss_feed(rss_text, subreddit)
+                        else:
+                            logger.warning(f"RSS r/{subreddit} returned status {response.status_code}")
                     except Exception as e:
                         logger.error(f"RSS error for r/{subreddit}: {e}")
                     
@@ -443,18 +440,17 @@ class RedditMonitor:
                     url = "https://www.reddit.com/r/all/comments.json?limit=100"
                     
                     try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                                if response.status == 200:
-                                    data = await response.json()
-                                    comment_count = len(data.get('data', {}).get('children', []))
-                                    logger.debug(f"📊 JSON API r/all: {comment_count} comments")
-                                    await self._process_json_comments(data)
-                                elif response.status == 429:
-                                    logger.warning("JSON API rate limited")
-                                    await asyncio.sleep(60)
-                                else:
-                                    logger.warning(f"JSON API returned status {response.status}")
+                        response = requests.get(url, timeout=10)
+                        if response.status_code == 200:
+                            data = response.json()
+                            comment_count = len(data.get('data', {}).get('children', []))
+                            logger.debug(f"📊 JSON API r/all: {comment_count} comments")
+                            await self._process_json_comments(data)
+                        elif response.status_code == 429:
+                            logger.warning("JSON API rate limited")
+                            await asyncio.sleep(60)
+                        else:
+                            logger.warning(f"JSON API returned status {response.status_code}")
                     except Exception as e:
                         logger.error(f"JSON API error for r/all: {e}")
                     
@@ -469,14 +465,13 @@ class RedditMonitor:
                         url = f"https://www.reddit.com/r/{chunk_str}/comments.json?limit=25"
                         
                         try:
-                            async with aiohttp.ClientSession() as session:
-                                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                                    if response.status == 200:
-                                        data = await response.json()
-                                        await self._process_json_comments(data)
-                                    elif response.status == 429:
-                                        logger.warning("JSON API rate limited")
-                                        await asyncio.sleep(60)
+                            response = requests.get(url, timeout=10)
+                            if response.status_code == 200:
+                                data = response.json()
+                                await self._process_json_comments(data)
+                            elif response.status_code == 429:
+                                logger.warning("JSON API rate limited")
+                                await asyncio.sleep(60)
                         except Exception as e:
                             logger.error(f"JSON API error for {chunk_str}: {e}")
                         
@@ -1089,14 +1084,13 @@ class RedditMonitor:
         try:
             url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25"
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        await self._process_subreddit_posts(data, subreddit)
-                    elif response.status == 429:
-                        logger.warning(f"Rate limited for r/{subreddit}")
-                        await asyncio.sleep(30)
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                await self._process_subreddit_posts(data, subreddit)
+            elif response.status_code == 429:
+                logger.warning(f"Rate limited for r/{subreddit}")
+                await asyncio.sleep(30)
                         
         except Exception as e:
             logger.error(f"Error monitoring r/{subreddit} posts: {e}")
