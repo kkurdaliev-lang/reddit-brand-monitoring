@@ -1698,6 +1698,76 @@ def weekly_mentions():
     
     return jsonify(weekly_data)
 
+@app.route('/re-evaluate-sentiment')
+def re_evaluate_sentiment():
+    """Re-evaluate sentiment for all existing entries using Groq"""
+    if not reddit_monitor or not reddit_monitor.sentiment:
+        return jsonify({"error": "Sentiment analyzer not available"}), 500
+    
+    try:
+        with db_manager.get_connection() as conn:
+            # Get all entries that need re-evaluation
+            cursor = conn.execute("""
+                SELECT id, title, body, brand 
+                FROM mentions 
+                ORDER BY created DESC
+            """)
+            entries = cursor.fetchall()
+        
+        if not entries:
+            return jsonify({"message": "No entries found to re-evaluate", "updated": 0})
+        
+        updated_count = 0
+        total_count = len(entries)
+        
+        # Process in batches to avoid overwhelming the API
+        batch_size = 10
+        
+        for i in range(0, len(entries), batch_size):
+            batch = entries[i:i + batch_size]
+            
+            for entry_id, title, body, brand in batch:
+                try:
+                    # Create context text from title and body
+                    context_text = f"{title or ''} {body or ''}".strip()
+                    
+                    if context_text and len(context_text) > 10:
+                        # Use the new Groq sentiment analysis
+                        new_sentiment = reddit_monitor.sentiment.analyze(context_text, brand)
+                        
+                        # Update the database
+                        with db_manager.get_connection() as conn:
+                            conn.execute("""
+                                UPDATE mentions 
+                                SET sentiment = ? 
+                                WHERE id = ?
+                            """, (new_sentiment, entry_id))
+                            conn.commit()
+                        
+                        updated_count += 1
+                        
+                        # Log progress every 50 updates
+                        if updated_count % 50 == 0:
+                            print(f"🔄 Re-evaluated {updated_count}/{total_count} entries...")
+                    
+                except Exception as e:
+                    print(f"❌ Error re-evaluating entry {entry_id}: {e}")
+                    continue
+            
+            # Small delay between batches to be nice to the API
+            import time
+            time.sleep(2)
+        
+        return jsonify({
+            "message": f"Successfully re-evaluated sentiment for {updated_count} entries",
+            "updated": updated_count,
+            "total": total_count,
+            "success_rate": f"{(updated_count/total_count)*100:.1f}%" if total_count > 0 else "0%"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Re-evaluation failed: {str(e)}"}), 500
+
 # HTML Template (embedded) - User's Preferred Version
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -1750,6 +1820,7 @@ HTML_TEMPLATE = '''
   <p class="csv-btn">
     <button id="csv-btn" onclick="downloadCurrentBrandCSV()">📥 Download CSV</button>
     <button id="pdf-btn" style="display:none;" onclick="downloadPDF()">📄 Download as PDF</button>
+    <button id="re-evaluate-btn" onclick="reEvaluateSentiment()" style="background-color: #28a745;">🔄 Re-evaluate All Sentiment</button>
   </p>
 
   <div id="mentions-tab">
@@ -1888,6 +1959,40 @@ HTML_TEMPLATE = '''
 
     function downloadCurrentBrandCSV() {
       window.location.href = `/download?brand=${currentBrand}`;
+    }
+
+    function reEvaluateSentiment() {
+      if (!confirm("This will re-analyze ALL entries in the database with the new Groq sentiment analysis. This may take a few minutes. Continue?")) {
+        return;
+      }
+      
+      const button = document.getElementById('re-evaluate-btn');
+      const originalText = button.textContent;
+      button.textContent = '🔄 Processing...';
+      button.disabled = true;
+      
+      fetch('/re-evaluate-sentiment')
+        .then(response => response.json())
+        .then(data => {
+          if (data.error) {
+            alert(`Error: ${data.error}`);
+          } else {
+            alert(`✅ Success! ${data.message}\n\nUpdated: ${data.updated}/${data.total} entries\nSuccess rate: ${data.success_rate}`);
+            // Reload the current view to show updated sentiment
+            if (document.getElementById("mentions-tab").style.display !== "none") {
+              loadData();
+            } else {
+              loadStats();
+            }
+          }
+        })
+        .catch(error => {
+          alert(`Error: ${error.message}`);
+        })
+        .finally(() => {
+          button.textContent = originalText;
+          button.disabled = false;
+        });
     }
 
          function loadStats() {
