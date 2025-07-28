@@ -1566,8 +1566,8 @@ def download_csv():
     # Write data
     for mention in mentions:
         type_val, subreddit, author, permalink, created, title, body, sentiment = mention
-        # Create preview from title or body
-        preview = title if title else (body if body else "")
+        # Create preview from body (actual content) or title
+        preview = body if body else (title if title else "")
         # Truncate preview if too long
         if len(preview) > 200:
             preview = preview[:200] + "..."
