@@ -6,11 +6,13 @@ All-in-One Reddit Brand Monitor
 - Built-in web interface
 - Real-time monitoring
 - Perfect for commercial deployment
+- Now monitoring ALL of Reddit!
 """
 
 import asyncio
-import aiohttp
+# import aiohttp  # Commented out due to Python 3.13 compatibility issues
 import sqlite3
+import sys
 import praw
 import prawcore
 import requests
@@ -23,7 +25,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set, Optional
 from dataclasses import dataclass, asdict
-from flask import Flask, render_template, jsonify, request, send_file
+from flask import Flask, render_template_string, jsonify, request, send_file
 import os
 from contextlib import contextmanager
 import tempfile
@@ -36,20 +38,34 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 CONFIG = {
-    'database_file': 'reddit_monitor.db',
+    'database_file': os.getenv('DATABASE_PATH', '/app/data/reddit_monitor.db'),
     'reddit': {
         'client_id': os.getenv('REDDIT_CLIENT_ID', ''),
         'client_secret': os.getenv('REDDIT_CLIENT_SECRET', ''),
         'user_agent': 'AllInOneBrandMonitor/1.0'
     },
-    'hf_api_token': os.getenv('HF_API_TOKEN', ''),
+    'groq_api_token': os.getenv('GROQ_API_TOKEN', ''),
     'brands': {
         'badinka': r'[@#]?badinka(?:\.com)?',
-        'iheartraves': r'[@#]?iheartraves(?:\.com)?'
+        'devilwalking': r'[@#]?devil\s*walking(?:\.com)?',  # Matches both "devilwalking" and "devil walking"
+        # Add more brands here if needed:
+        # 'rave_fashion': r'[@#]?rave\s*fashion',
+        # 'festival_outfit': r'[@#]?festival\s*outfit',
     },
+    'monitor_all_reddit': True,  # Monitor all of Reddit, not just specific subreddits
+    'focused_subreddits': [
+        # High-priority subreddits for extra coverage
+        "Rezz", "aves", "ElectricForest", "sewing", "avesfashion",
+        "cyber_fashion", "aveoutfits", "RitaFourEssenceSystem", "SoftDramatics", "Shein",
+        "avesNYC", "veld", "BADINKA", "PlusSize",
+        "LostLandsMusicFest", "festivals", "avefashion", "avesafe", "EDCOrlando",
+        "findfashion", "BassCanyon", "Aerials", "electricdaisycarnival", "bonnaroo",
+        "Tomorrowland", "femalefashion", "Soundhaven", "warpedtour", "Shambhala",
+        "Lollapalooza", "EDM", "BeyondWonderland", "kandi"
+    ],
     'subreddits': [
-        "aves", "ElectricForest", "festivals", "EDM", "electricdaisycarnival",
-        "sewing", "fashion", "findfashion", "Shein", "PlusSize"
+        # Fallback subreddits
+        "all", "popular", "announcements"
     ],
     'port': int(os.getenv('PORT', 5000))
 }
@@ -98,24 +114,20 @@ class DatabaseManager:
             # Create indexes for better performance
             conn.execute('CREATE INDEX IF NOT EXISTS idx_brand ON mentions(brand)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_created ON mentions(created)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_type ON mentions(type)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_subreddit ON mentions(subreddit)')
-            
             conn.commit()
-            logger.info("Database initialized successfully")
     
     @contextmanager
     def get_connection(self):
-        """Get database connection with context manager"""
-        conn = sqlite3.connect(self.db_file, timeout=30.0)
-        conn.row_factory = sqlite3.Row
+        """Context manager for database connections"""
+        conn = sqlite3.connect(self.db_file)
         try:
             yield conn
         finally:
             conn.close()
     
     def insert_mentions(self, mentions: List[Mention]):
-        """Insert mentions into database"""
+        """Insert multiple mentions, handling duplicates"""
         if not mentions:
             return
         
@@ -123,8 +135,7 @@ class DatabaseManager:
             for mention in mentions:
                 conn.execute('''
                     INSERT OR REPLACE INTO mentions 
-                    (id, type, title, body, permalink, created, subreddit, author, 
-                     score, sentiment, brand, source)
+                    (id, type, title, body, permalink, created, subreddit, author, score, sentiment, brand, source)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     mention.id, mention.type, mention.title, mention.body,
@@ -132,91 +143,171 @@ class DatabaseManager:
                     mention.author, mention.score, mention.sentiment,
                     mention.brand, mention.source
                 ))
-            
             conn.commit()
-            logger.info(f"Inserted {len(mentions)} mentions")
+            logger.info(f"Inserted {len(mentions)} mentions into database")
     
     def get_existing_ids(self) -> Set[str]:
-        """Get all existing mention IDs"""
+        """Get set of existing mention IDs to avoid duplicates"""
         with self.get_connection() as conn:
-            cursor = conn.execute('SELECT id FROM mentions')
-            return {row[0] for row in cursor.fetchall()}
+            cursor = conn.execute("SELECT id FROM mentions")
+            return set(row[0] for row in cursor.fetchall())
     
-    def execute_query(self, query: str, params: tuple = ()) -> List[sqlite3.Row]:
-        """Execute a query and return results"""
+    def get_core_reddit_ids(self) -> Set[str]:
+        """Extract core Reddit IDs from various formats to prevent duplicates"""
         with self.get_connection() as conn:
-            cursor = conn.execute(query, params)
-            return cursor.fetchall()
+            cursor = conn.execute("SELECT id FROM mentions")
+            core_ids = set()
+            for row in cursor.fetchall():
+                raw_id = row[0]
+                # Extract core Reddit ID from different formats
+                if raw_id.startswith('json_'):
+                    # Handle old format: json_n3z93h6_badinka -> n3z93h6
+                    parts = raw_id.split('_')
+                    if len(parts) >= 2:
+                        core_id = parts[1]  # Extract the Reddit ID part
+                        core_ids.add(core_id)
+                else:
+                    # Handle direct Reddit IDs: n3z93h6 -> n3z93h6
+                    core_ids.add(raw_id)
+            return core_ids
+    
+    def get_existing_content_hashes(self) -> Set[str]:
+        """Get set of content hashes to detect duplicates by content"""
+        with self.get_connection() as conn:
+            cursor = conn.execute("SELECT body, brand, subreddit FROM mentions")
+            hashes = set()
+            for row in cursor.fetchall():
+                body, brand, subreddit = row
+                # Create a content-based hash for duplicate detection
+                content_hash = f"{brand}_{subreddit}_{hash(body[:100])}"
+                hashes.add(content_hash)
+            return hashes
 
 class SentimentAnalyzer:
     def __init__(self, api_token: str):
-        self.api_url = "https://api-inference.huggingface.co/models/tabularisai/multilingual-sentiment-analysis"
-        self.headers = {"Authorization": f"Bearer {api_token}"}
-        self.last_request = 0
-        self.min_delay = 1.0  # Minimum delay between requests
+        self.api_token = api_token
+        self.api_url = "https://api.groq.com/openai/v1/chat/completions"
+        logger.info(f"🤖 Groq sentiment analyzer initialized with URL: {self.api_url}")
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_token}"
+        } if api_token else {}
     
-    async def analyze(self, text: str) -> str:
-        """Analyze sentiment of text"""
-        if not text or len(text.strip()) == 0 or not self.headers.get("Authorization") or "Bearer " not in self.headers.get("Authorization"):
-            return "neutral"
+    def analyze(self, context_text: str, brand_name: str = "the brand") -> str:
+        """Analyze sentiment specifically toward a brand using Groq"""
+        logger.info(f"🔍 Starting Groq brand sentiment analysis for '{brand_name}' in text: '{context_text[:100]}...'")
         
-        # Rate limiting
-        now = time.time()
-        if now - self.last_request < self.min_delay:
-            await asyncio.sleep(self.min_delay - (now - self.last_request))
+        if not self.api_token:
+            logger.warning("❌ No Groq API token provided")
+            return "neutral"
+            
+        if not context_text.strip():
+            logger.warning("❌ Empty text provided for sentiment analysis")
+            return "neutral"
         
         try:
-            async with aiohttp.ClientSession() as session:
-                payload = {"inputs": text[:1000]}
-                async with session.post(
-                    self.api_url,
-                    headers=self.headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    self.last_request = time.time()
-                    
-                    if response.status == 200:
-                        result = await response.json()
-                        scores = result[0]
-                        top_label = max(scores, key=lambda x: x['score'])['label'].lower()
-                        
-                        if 'positive' in top_label:
-                            return "positive"
-                        elif 'negative' in top_label:
-                            return "negative"
-                        else:
-                            return "neutral"
-                    else:
-                        logger.warning(f"Sentiment API returned {response.status}")
-                        return "neutral"
+            # Create brand-focused prompt
+            prompt = f"""Analyze the sentiment specifically about the brand '{brand_name}' in this text:
+
+"{context_text[:500]}"
+
+Focus ONLY on opinions, experiences, or feelings about this specific brand. Ignore general complaints or negative words that don't relate to the brand itself.
+
+For example:
+- "I ordered from {brand_name} and had zero issues, great quality" = positive (customer satisfied with brand)
+- "Shipping took forever but {brand_name} quality is amazing" = positive (complaint about shipping, not brand)
+- "{brand_name} clothes are overpriced and poor quality" = negative (directly about brand)
+
+Respond with ONLY ONE WORD: positive, negative, or neutral"""
+
+            payload = {
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": 10,
+                "temperature": 0.1
+            }
+            
+            logger.info(f"📡 Sending request to Groq API")
+            logger.info(f"🎯 Brand focus: {brand_name}")
+            
+            response = requests.post(self.api_url, headers=self.headers, json=payload, timeout=15)
+            logger.info(f"📊 Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                result = response.json()
+                sentiment_text = result['choices'][0]['message']['content'].strip().lower()
+                logger.info(f"🤖 Groq response: '{sentiment_text}'")
+                
+                # Clean and validate response
+                if 'positive' in sentiment_text:
+                    sentiment = 'positive'
+                elif 'negative' in sentiment_text:
+                    sentiment = 'negative'
+                else:
+                    sentiment = 'neutral'
+                
+                logger.info(f"🎯 Final brand sentiment for '{brand_name}': {sentiment}")
+                return sentiment
+            else:
+                logger.error(f"❌ Groq API returned status {response.status_code}: {response.text}")
         except Exception as e:
-            logger.error(f"Sentiment analysis failed: {e}")
-            return "neutral"
+            logger.error(f"💥 Groq sentiment analysis error: {e}")
+            import traceback
+            logger.error(f"📚 Traceback: {traceback.format_exc()}")
+        
+        logger.warning("⚠️ Falling back to neutral sentiment")
+        return "neutral"
 
 class RedditMonitor:
-    def __init__(self, config: Dict, db: DatabaseManager):
+    def __init__(self, config: dict, db: DatabaseManager):
         self.config = config
         self.db = db
         self.brands = {
             name: re.compile(pattern, re.IGNORECASE)
             for name, pattern in config['brands'].items()
         }
-        self.sentiment = SentimentAnalyzer(config['hf_api_token'])
+        self.sentiment = SentimentAnalyzer(config['groq_api_token'])
         self.seen_ids = self.db.get_existing_ids()
-        self.mention_buffer: List[Mention] = []
+        self.seen_core_ids = self.db.get_core_reddit_ids()  # For handling mixed ID formats
+        self.seen_content = self.db.get_existing_content_hashes()
+        logger.info(f"🔍 Loaded {len(self.seen_ids)} existing IDs to prevent duplicates")
+        logger.info(f"🔍 Loaded {len(self.seen_core_ids)} core Reddit IDs to prevent duplicates")
+        logger.info(f"🔍 Loaded {len(self.seen_content)} existing content hashes to prevent duplicates")
+        if self.seen_ids:
+            logger.info(f"🔍 Sample existing IDs: {list(self.seen_ids)[:3]}")  # Show first 3 IDs
+        if self.seen_core_ids:
+            logger.info(f"🔍 Sample core IDs: {list(self.seen_core_ids)[:3]}")  # Show first 3 core IDs
+        self.mention_buffer: List[Mention] = []  # For PRAW mention objects
+        self.json_mention_buffer = []  # For JSON mention dictionaries
         self.running = False
+        
+        # Backfill tracking for intelligent gap filling
+        self.last_comment_rate_limit = None
+        self.last_post_rate_limit = None
+        self.comment_rate_limit_start = None
+        self.post_rate_limit_start = None
         
         # Initialize Reddit client
         if config['reddit']['client_id'] and config['reddit']['client_secret']:
-            self.reddit = praw.Reddit(
-                client_id=config['reddit']['client_id'],
-                client_secret=config['reddit']['client_secret'],
-                user_agent=config['reddit']['user_agent']
-            )
+            try:
+                self.reddit = praw.Reddit(
+                    client_id=config['reddit']['client_id'],
+                    client_secret=config['reddit']['client_secret'],
+                    user_agent=config['reddit']['user_agent']
+                )
+                # Don't test connection during initialization to avoid blocking startup
+                logger.info("✅ PRAW Reddit client initialized (authentication will be tested during first use)")
+            except Exception as e:
+                logger.error(f"❌ PRAW initialization failed: {e}")
+                self.reddit = None
         else:
             self.reddit = None
-            logger.warning("Reddit credentials not provided - PRAW monitoring disabled")
+            logger.warning("❌ Reddit credentials not provided - PRAW monitoring disabled")
     
     def find_brands(self, text: str) -> List[str]:
         """Find brand mentions in text"""
@@ -226,16 +317,41 @@ class RedditMonitor:
                 brands_found.append(brand)
         return brands_found
     
+    def test_brand_patterns(self):
+        """Test brand patterns with sample text"""
+        test_texts = [
+            "I love badinka clothing!",
+            "Check out @badinka.com",
+            "#badinka is awesome",
+            "Devil walking is cool",
+            "devilwalking brand",
+            "devil walking fashion",
+            "This is a random text with no brands"
+        ]
+        
+        logger.info("🧪 Testing brand pattern recognition:")
+        for text in test_texts:
+            brands = self.find_brands(text)
+            if brands:
+                logger.info(f"✅ Found {brands} in: '{text}'")
+            else:
+                logger.info(f"❌ No brands in: '{text}'")
+    
     async def process_mention_buffer(self):
         """Process and save mentions from buffer"""
         if not self.mention_buffer:
             return
         
-        # Add sentiment analysis
+        # Add focused sentiment analysis for brand mentions only
         for mention in self.mention_buffer:
             if mention.sentiment is None:
-                text = f"{mention.title or ''} {mention.body or ''}"
-                mention.sentiment = await self.sentiment.analyze(text)
+                # Extract context around the brand mention for focused sentiment analysis
+                context_text = self._extract_brand_context(mention)
+                if context_text:
+                    mention.sentiment = self.sentiment.analyze(context_text, mention.brand)
+                    logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
+                else:
+                    mention.sentiment = "neutral"  # Fallback if no context found
         
         # Save to database
         self.db.insert_mentions(self.mention_buffer)
@@ -247,18 +363,26 @@ class RedditMonitor:
         
         while self.running:
             try:
-                for subreddit in self.config['subreddits']:
+                # Monitor all Reddit posts or specific subreddits
+                if self.config.get('monitor_all_reddit', False):
+                    subreddits_to_monitor = ["all", "popular"]
+                else:
+                    subreddits_to_monitor = self.config['subreddits']
+                
+                for subreddit in subreddits_to_monitor:
                     if not self.running:
                         break
                     
                     url = f"https://www.reddit.com/r/{subreddit}/new/.rss"
                     
                     try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                                if response.status == 200:
-                                    rss_text = await response.text()
-                                    await self._process_rss_feed(rss_text, subreddit)
+                        response = requests.get(url, timeout=10)
+                        if response.status_code == 200:
+                            rss_text = response.text
+                            logger.debug(f"📡 Fetched RSS for r/{subreddit} - {len(rss_text)} bytes")
+                            await self._process_rss_feed(rss_text, subreddit)
+                        else:
+                            logger.warning(f"RSS r/{subreddit} returned status {response.status_code}")
                     except Exception as e:
                         logger.error(f"RSS error for r/{subreddit}: {e}")
                     
@@ -278,37 +402,43 @@ class RedditMonitor:
         """Process RSS feed content"""
         try:
             feed = feedparser.parse(rss_text)
+            logger.debug(f"📊 RSS r/{subreddit}: {len(feed.entries)} entries")
             
             for entry in feed.entries:
-                post_id = entry.link.split('/')[-2] if '/' in entry.link else entry.link.split('/')[-1]
+                if not self.running:
+                    break
                 
-                if post_id in self.seen_ids:
+                # Extract Reddit ID from link
+                reddit_id = entry.link.split('/')[-2] if entry.link else entry.id
+                
+                if reddit_id in self.seen_ids:
                     continue
                 
-                title = entry.title
-                content = getattr(entry, 'summary', '')
-                text = f"{title} {content}"
+                # Check title and description for brand mentions
+                title = getattr(entry, 'title', '')
+                description = getattr(entry, 'summary', '')
+                full_text = f"{title} {description}"
                 
-                brands = self.find_brands(text)
+                brands = self.find_brands(full_text)
                 if brands:
                     for brand in brands:
                         mention = Mention(
-                            id=post_id,
+                            id=reddit_id,
                             type="post",
                             title=title,
-                            body=content,
+                            body=description,
                             permalink=entry.link,
-                            created=datetime.now(timezone.utc).isoformat(),
+                            created=datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc).isoformat(),
                             subreddit=subreddit,
-                            author="unknown",
-                            score=0,
+                            author=getattr(entry, 'author', 'unknown'),
+                            score=0,  # RSS doesn't provide scores
                             sentiment=None,
                             brand=brand,
                             source="rss"
                         )
                         
                         self.mention_buffer.append(mention)
-                        self.seen_ids.add(post_id)
+                        self.seen_ids.add(reddit_id)
                         logger.info(f"Found RSS mention: {brand} in r/{subreddit}")
                         
         except Exception as e:
@@ -320,27 +450,48 @@ class RedditMonitor:
         
         while self.running:
             try:
-                # Monitor specific subreddits
-                for subreddit_chunk in self._chunk_subreddits():
-                    if not self.running:
-                        break
-                    
-                    chunk_str = "+".join(subreddit_chunk)
-                    url = f"https://www.reddit.com/r/{chunk_str}/comments.json?limit=25"
+                # Monitor all Reddit or specific subreddits
+                if self.config.get('monitor_all_reddit', False):
+                    # Monitor all Reddit comments
+                    url = "https://www.reddit.com/r/all/comments.json?limit=100"
                     
                     try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                                if response.status == 200:
-                                    data = await response.json()
-                                    await self._process_json_comments(data)
-                                elif response.status == 429:
-                                    logger.warning("JSON API rate limited")
-                                    await asyncio.sleep(60)
+                        response = requests.get(url, timeout=10)
+                        if response.status_code == 200:
+                            data = response.json()
+                            comment_count = len(data.get('data', {}).get('children', []))
+                            logger.debug(f"📊 JSON API r/all: {comment_count} comments")
+                            await self._process_json_comments(data)
+                        elif response.status_code == 429:
+                            logger.warning("JSON API rate limited")
+                            await asyncio.sleep(60)
+                        else:
+                            logger.warning(f"JSON API returned status {response.status_code}")
                     except Exception as e:
-                        logger.error(f"JSON API error for {chunk_str}: {e}")
+                        logger.error(f"JSON API error for r/all: {e}")
                     
-                    await asyncio.sleep(5)  # Delay between chunks
+                    await asyncio.sleep(10)  # Slightly longer delay for r/all
+                else:
+                    # Monitor specific subreddits (original behavior)
+                    for subreddit_chunk in self._chunk_subreddits():
+                        if not self.running:
+                            break
+                        
+                        chunk_str = "+".join(subreddit_chunk)
+                        url = f"https://www.reddit.com/r/{chunk_str}/comments.json?limit=25"
+                        
+                        try:
+                            response = requests.get(url, timeout=10)
+                            if response.status_code == 200:
+                                data = response.json()
+                                await self._process_json_comments(data)
+                            elif response.status_code == 429:
+                                logger.warning("JSON API rate limited")
+                                await asyncio.sleep(60)
+                        except Exception as e:
+                            logger.error(f"JSON API error for {chunk_str}: {e}")
+                        
+                        await asyncio.sleep(5)  # Delay between chunks
                 
                 # Flush buffer if needed
                 if self.mention_buffer:
@@ -349,96 +500,162 @@ class RedditMonitor:
                 await asyncio.sleep(30)  # Wait before next cycle
                 
             except Exception as e:
-                logger.error(f"JSON monitoring error: {e}")
+                logger.error(f"JSON API monitoring error: {e}")
                 await asyncio.sleep(60)
     
-    def _chunk_subreddits(self, chunk_size: int = 3):
-        """Split subreddits into chunks"""
+    def _chunk_subreddits(self, chunk_size: int = 10):
+        """Split subreddits into chunks for API efficiency"""
         subreddits = self.config['subreddits']
         for i in range(0, len(subreddits), chunk_size):
             yield subreddits[i:i + chunk_size]
     
-    async def _process_json_comments(self, data: Dict):
-        """Process comments from JSON API"""
-        children = data.get("data", {}).get("children", [])
-        
-        for item in children:
-            comment_data = item.get("data", {})
-            comment_id = comment_data.get("id")
-            
-            if not comment_id or comment_id in self.seen_ids:
-                continue
-            
-            body = comment_data.get("body", "")
-            if len(body) < 10:  # Skip very short comments
-                continue
-            
-            brands = self.find_brands(body)
-            if brands:
-                for brand in brands:
-                    mention = Mention(
-                        id=comment_id,
-                        type="comment",
-                        title=None,
-                        body=body,
-                        permalink=f"https://reddit.com{comment_data['permalink']}",
-                        created=datetime.fromtimestamp(comment_data["created_utc"], tz=timezone.utc).isoformat(),
-                        subreddit=comment_data["subreddit"],
-                        author=comment_data["author"],
-                        score=comment_data["score"],
-                        sentiment=None,
-                        brand=brand,
-                        source="json"
-                    )
+    async def _process_json_comments(self, data: dict):
+        """Process JSON API comment data"""
+        try:
+            if 'data' in data and 'children' in data['data']:
+                for item in data['data']['children']:
+                    if not self.running:
+                        break
                     
-                    self.mention_buffer.append(mention)
-                    self.seen_ids.add(comment_id)
-                    logger.info(f"Found JSON mention: {brand} in r/{comment_data['subreddit']}")
+                    comment_data = item['data']
+                    comment_id = comment_data.get('id')
+                    
+                    if comment_id in self.seen_ids:
+                        continue
+                    
+                    body = comment_data.get('body', '')
+                    brands = self.find_brands(body)
+                    
+                    if brands:
+                        for brand in brands:
+                            mention = Mention(
+                                id=comment_id,
+                                type="comment",
+                                title=None,
+                                body=body,
+                                permalink=f"https://reddit.com{comment_data.get('permalink', '')}",
+                                created=datetime.fromtimestamp(comment_data.get('created_utc', 0), tz=timezone.utc).isoformat(),
+                                subreddit=comment_data.get('subreddit', 'unknown'),
+                                author=comment_data.get('author', 'unknown'),
+                                score=comment_data.get('score', 0),
+                                sentiment=None,
+                                brand=brand,
+                                source="json_api"
+                            )
+                            
+                            self.mention_buffer.append(mention)
+                            self.seen_ids.add(comment_id)
+                            logger.info(f"Found JSON mention: {brand} in r/{comment_data['subreddit']}")
+                            
+        except Exception as e:
+            logger.error(f"JSON processing error: {e}")
     
     async def start_monitoring(self):
         """Start all monitoring tasks"""
         self.running = True
         logger.info("Starting Reddit monitoring...")
         
+        # Test brand patterns
+        self.test_brand_patterns()
+        
         tasks = [
-            self.monitor_rss_feeds(),
-            self.monitor_json_api()
+            # RSS and JSON API are getting 403 errors, but PRAW is working perfectly
+            # self.monitor_rss_feeds(),
+            # self.monitor_json_api(),
+            self.monitor_focused_subreddits()  # Additional focused monitoring
         ]
         
-        # Add PRAW monitoring if available
+        # Start PRAW monitoring in separate thread if available
         if self.reddit:
-            tasks.append(self.monitor_praw_comments())
+            praw_thread = threading.Thread(target=self._monitor_praw_sync, daemon=True)
+            praw_thread.start()
         
         await asyncio.gather(*tasks, return_exceptions=True)
     
-    async def monitor_praw_comments(self):
-        """Monitor comments using PRAW (if available)"""
+    def _monitor_praw_sync(self):
+        """Monitor comments and posts using PRAW in sync mode (separate thread)"""
         if not self.reddit:
             return
         
-        logger.info("Starting PRAW monitoring...")
+        logger.info("Starting PRAW monitoring with staggered timing...")
+        
+        # Start comment monitoring immediately
+        comment_thread = threading.Thread(target=self._monitor_praw_comments, daemon=True)
+        comment_thread.start()
+        logger.info("✅ Started PRAW comment monitoring")
+        
+        # Start JSON monitoring immediately (different endpoint, less conflicts)
+        json_thread = threading.Thread(target=self._monitor_json_comments_chunked, daemon=True)
+        json_thread.start()
+        logger.info("✅ Started enhanced JSON comment monitoring with chunking")
+        
+        # STAGGERED: Wait 30 seconds before starting post monitoring to offset rate limits
+        logger.info("⏳ Waiting 30 seconds before starting post monitoring (staggered approach)...")
+        time.sleep(30)
+        
+        post_thread = threading.Thread(target=self._monitor_praw_posts, daemon=True)
+        post_thread.start()
+        logger.info("✅ Started PRAW post monitoring (staggered)")
+        
+        # Wait for threads to complete
+        comment_thread.join()
+        post_thread.join()
+        json_thread.join()
+    
+    def _monitor_praw_comments(self):
+        """Monitor comments using PRAW"""
+        logger.info("Starting PRAW comment monitoring...")
+        
+        # Add startup delay to avoid processing recent comments that might be in database
+        logger.info("⏳ Waiting 30 seconds to avoid processing recent comments...")
+        time.sleep(30)
         
         while self.running:
             try:
-                subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
+                # Monitor all Reddit comments
+                if self.config.get('monitor_all_reddit', False):
+                    subreddit = self.reddit.subreddit("all")
+                else:
+                    subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
+                # Use skip_existing=True but also manually track to ensure no duplicates
                 comment_stream = subreddit.stream.comments(skip_existing=True, pause_after=10)
+                logger.info(f"🎯 Starting comment stream for {subreddit} (skip_existing=True)")
                 
                 for comment in comment_stream:
                     if not self.running:
                         break
                     
                     if comment is None:
-                        await asyncio.sleep(1)
+                        time.sleep(1.5)  # Slightly longer pause to reduce rate limiting
                         continue
                     
                     if comment.id in self.seen_ids:
+                        logger.debug(f"⏭️ Skipping already processed comment: {comment.id}")
                         continue
+                    
+                    # Debug: Log every 100th comment to see what we're processing
+                    if hasattr(self, '_comment_count'):
+                        self._comment_count += 1
+                    else:
+                        self._comment_count = 1
+                    
+                    if self._comment_count % 100 == 0:
+                        logger.debug(f"🔍 Processed {self._comment_count} comments, checking: '{comment.body[:50]}...'")
                     
                     brands = self.find_brands(comment.body)
                     if brands:
                         for brand in brands:
+                            # Analyze sentiment IMMEDIATELY
+                            context_text = comment.body[:400]  # Focus on relevant content
+                            try:
+                                sentiment = self.sentiment.analyze(context_text, brand)
+                                logger.info(f"💭 Analyzed sentiment for '{brand}': {sentiment}")
+                            except Exception as e:
+                                sentiment = "neutral"
+                                logger.warning(f"Sentiment analysis failed for {brand}: {e}")
+                            
                             mention = Mention(
-                                id=comment.id,
+                                id=comment.id,  # Use actual Reddit comment ID (e.g., n3z93h6)
                                 type="comment",
                                 title=None,
                                 body=comment.body,
@@ -447,26 +664,608 @@ class RedditMonitor:
                                 subreddit=str(comment.subreddit),
                                 author=str(comment.author),
                                 score=comment.score,
-                                sentiment=None,
+                                sentiment=sentiment,  # Set analyzed sentiment
                                 brand=brand,
                                 source="praw"
                             )
                             
-                            self.mention_buffer.append(mention)
-                            self.seen_ids.add(comment.id)
-                            logger.info(f"Found PRAW mention: {brand} in r/{comment.subreddit}")
+                            # Check for duplicates using ID, core ID, and content
+                            content_hash = f"{brand}_{str(comment.subreddit)}_{hash(comment.body[:100])}"
+                            
+                            is_duplicate = (comment.id in self.seen_ids or 
+                                          comment.id in self.seen_core_ids or 
+                                          content_hash in self.seen_content)
+                            
+                            if not is_duplicate:
+                                # Save to database IMMEDIATELY
+                                self.db.insert_mentions([mention])
+                                self.seen_ids.add(comment.id)
+                                self.seen_core_ids.add(comment.id)
+                                self.seen_content.add(content_hash)
+                                logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment} (ID: {comment.id})")
+                            else:
+                                logger.info(f"⏭️ Skipped duplicate: ID={comment.id in self.seen_ids}, CoreID={comment.id in self.seen_core_ids}, Content={content_hash in self.seen_content} for brand {brand}")
                     
-                    # Flush buffer periodically
-                    if len(self.mention_buffer) >= 10:
-                        await self.process_mention_buffer()
+                    # Flush buffer more frequently for immediate processing
+                    if len(self.mention_buffer) >= 1:  # Process immediately
+                        # Process buffer with sentiment analysis
+                        if self.mention_buffer:
+                            logger.info(f"💾 Processing {len(self.mention_buffer)} PRAW mentions from buffer...")
+                            self._process_praw_buffer_with_sentiment()
+                            self.mention_buffer.clear()
                 
             except prawcore.exceptions.TooManyRequests:
+                # Track rate limit period for backfill
+                self.comment_rate_limit_start = datetime.now(timezone.utc)
                 logger.warning("PRAW rate limited, sleeping 60 seconds")
-                await asyncio.sleep(60)
+                time.sleep(60)
+                
+                # After rate limit ends, trigger backfill
+                rate_limit_end = datetime.now(timezone.utc)
+                if self.comment_rate_limit_start:
+                    logger.info("🔄 Rate limit ended, starting comment backfill...")
+                    threading.Thread(
+                        target=self._backfill_missed_content,
+                        args=("comments", self.comment_rate_limit_start, rate_limit_end),
+                        daemon=True
+                    ).start()
             except Exception as e:
-                logger.error(f"PRAW monitoring error: {e}")
-                await asyncio.sleep(30)
+                logger.error(f"PRAW comment monitoring error: {e}")
+                time.sleep(30)
     
+    def _monitor_praw_posts(self):
+        """Monitor posts using PRAW"""
+        logger.info("Starting PRAW post monitoring...")
+        
+        # Add startup delay to avoid processing recent posts that might be in database  
+        logger.info("⏳ Waiting 30 seconds to avoid processing recent posts...")
+        time.sleep(30)
+        
+        while self.running:
+            try:
+                # Monitor all Reddit posts
+                if self.config.get('monitor_all_reddit', False):
+                    subreddit = self.reddit.subreddit("all")
+                else:
+                    subreddit = self.reddit.subreddit("+".join(self.config['subreddits']))
+                
+                post_stream = subreddit.stream.submissions(skip_existing=True, pause_after=10)
+                
+                for post in post_stream:
+                    if not self.running:
+                        break
+                    
+                    if post is None:
+                        time.sleep(1.5)  # Slightly longer pause to reduce rate limiting
+                        continue
+                    
+                    if post.id in self.seen_ids:
+                        continue
+                    
+                    # Debug: Log every 50th post to see what we're processing
+                    if hasattr(self, '_post_count'):
+                        self._post_count += 1
+                    else:
+                        self._post_count = 1
+                    
+                    if self._post_count % 50 == 0:
+                        logger.debug(f"📝 Processed {self._post_count} posts, checking: '{post.title[:50]}...'")
+                    
+                    # Check both title and selftext for brand mentions
+                    full_text = f"{post.title} {post.selftext}"
+                    brands = self.find_brands(full_text)
+                    
+                    if brands:
+                        for brand in brands:
+                            # Analyze sentiment IMMEDIATELY
+                            context_text = full_text[:400]  # Focus on relevant content
+                            try:
+                                sentiment = self.sentiment.analyze(context_text, brand)
+                                logger.info(f"💭 Analyzed post sentiment for '{brand}': {sentiment}")
+                            except Exception as e:
+                                sentiment = "neutral"
+                                logger.warning(f"Post sentiment analysis failed for {brand}: {e}")
+                            
+                            mention = Mention(
+                                id=post.id,  # Use actual Reddit post ID
+                                type="post",
+                                title=post.title,
+                                body=post.selftext,
+                                permalink=f"https://reddit.com{post.permalink}",
+                                created=datetime.fromtimestamp(post.created_utc, tz=timezone.utc).isoformat(),
+                                subreddit=str(post.subreddit),
+                                author=str(post.author),
+                                score=post.score,
+                                sentiment=sentiment,  # Set analyzed sentiment
+                                brand=brand,
+                                source="praw"
+                            )
+                            
+                            # Check for duplicates using ID, core ID, and content
+                            content_hash = f"{brand}_{str(post.subreddit)}_{hash(full_text[:100])}"
+                            
+                            is_duplicate = (post.id in self.seen_ids or 
+                                          post.id in self.seen_core_ids or 
+                                          content_hash in self.seen_content)
+                            
+                            if not is_duplicate:
+                                # Save to database IMMEDIATELY
+                                self.db.insert_mentions([mention])
+                                self.seen_ids.add(post.id)
+                                self.seen_core_ids.add(post.id)
+                                self.seen_content.add(content_hash)
+                                logger.info(f"✅ Saved PRAW post mention: {brand} in r/{post.subreddit} with sentiment: {sentiment}")
+                            else:
+                                logger.info(f"⏭️ Skipped duplicate post: ID={post.id in self.seen_ids}, CoreID={post.id in self.seen_core_ids}, Content={content_hash in self.seen_content} for brand {brand}")
+                    
+                    # Flush buffer more frequently for immediate processing
+                    if len(self.mention_buffer) >= 1:  # Process immediately
+                        # Process buffer with sentiment analysis
+                        if self.mention_buffer:
+                            logger.info(f"💾 Processing {len(self.mention_buffer)} PRAW post mentions from buffer...")
+                            self._process_praw_buffer_with_sentiment()
+                            self.mention_buffer.clear()
+                
+            except prawcore.exceptions.TooManyRequests:
+                # Track rate limit period for backfill
+                self.post_rate_limit_start = datetime.now(timezone.utc)
+                logger.warning("PRAW posts rate limited, sleeping 60 seconds")
+                time.sleep(60)
+                
+                # After rate limit ends, trigger backfill
+                rate_limit_end = datetime.now(timezone.utc)
+                if self.post_rate_limit_start:
+                    logger.info("🔄 Rate limit ended, starting post backfill...")
+                    threading.Thread(
+                        target=self._backfill_missed_content,
+                        args=("posts", self.post_rate_limit_start, rate_limit_end),
+                        daemon=True
+                    ).start()
+            except Exception as e:
+                logger.error(f"PRAW post monitoring error: {e}")
+                time.sleep(30)
+    
+    def _process_json_buffer_with_sentiment(self):
+        """Process JSON mention buffer with sentiment analysis (synchronous)"""
+        if not self.json_mention_buffer:
+            return
+        
+        try:
+            for mention_dict in self.json_mention_buffer:
+                # Extract context and analyze sentiment
+                context_text = mention_dict.get('context', mention_dict.get('content', ''))
+                if context_text and len(context_text) > 10:
+                    sentiment = self.sentiment.analyze(context_text, mention_dict['brand'])
+                    logger.debug(f"💭 Analyzed sentiment for '{mention_dict['brand']}': {sentiment}")
+                else:
+                    sentiment = "neutral"
+                
+                # Create Mention object and save to database
+                mention_obj = Mention(
+                    id=f"json_{mention_dict['brand']}_{int(mention_dict['created'])}_{hash(mention_dict['content'][:50])}",
+                    type="comment",
+                    title=mention_dict['title'],
+                    body=mention_dict['content'],
+                    permalink=mention_dict['url'],
+                    created=datetime.fromtimestamp(mention_dict['created']).isoformat(),
+                    subreddit=mention_dict['location'],
+                    author=mention_dict.get('author', 'unknown'),
+                    score=mention_dict.get('score', 0),
+                    sentiment=sentiment,
+                    brand=mention_dict['brand'],
+                    source="json_chunked_monitoring"
+                )
+                
+                self.db.insert_mentions([mention_obj])
+                logger.info(f"✅ Saved {mention_dict['brand']} mention to database")
+                
+        except Exception as e:
+            logger.error(f"Error processing JSON buffer: {e}")
+    
+    def _process_praw_buffer_with_sentiment(self):
+        """Process PRAW mention buffer with sentiment analysis (synchronous)"""
+        if not self.mention_buffer:
+            return
+        
+        # Add sentiment analysis for each mention
+        for mention in self.mention_buffer:
+            if mention.sentiment is None:
+                # Extract context around the brand mention for focused sentiment analysis
+                context_text = self._extract_brand_context(mention)
+                if context_text:
+                    # Run sentiment analysis on brand-focused context
+                    mention.sentiment = self.sentiment.analyze(context_text, mention.brand)
+                    logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
+                else:
+                    mention.sentiment = "neutral"  # Fallback if no context found
+        
+        # Save to database
+        self.db.insert_mentions(self.mention_buffer)
+        logger.info(f"💭 Processed {len(self.mention_buffer)} brand mentions with sentiment analysis")
+    
+    def _extract_simple_context(self, text, brand_name):
+        """Simple context extraction for JSON monitoring"""
+        text_lower = text.lower()
+        brand_lower = brand_name.lower()
+        
+        # Find brand position
+        pos = text_lower.find(brand_lower)
+        if pos == -1:
+            return text[:200]  # Return first 200 chars if brand not found
+        
+        # Extract 100 chars before and after the brand
+        start = max(0, pos - 100)
+        end = min(len(text), pos + len(brand_lower) + 100)
+        
+        return text[start:end].strip()
+    
+    def _extract_brand_context(self, mention):
+        """Extract context around brand mention for focused sentiment analysis"""
+        full_text = f"{mention.title or ''} {mention.body or ''}".lower()
+        brand_name = mention.brand.lower()
+        
+        # Handle multi-word brands like "devil walking"
+        if ' ' in brand_name:
+            brand_patterns = [brand_name, brand_name.replace(' ', '')]
+        else:
+            brand_patterns = [brand_name, brand_name.replace(' ', '')]
+        
+        # Find the brand in the text
+        brand_position = -1
+        matched_pattern = None
+        
+        for pattern in brand_patterns:
+            pos = full_text.find(pattern)
+            if pos != -1:
+                brand_position = pos
+                matched_pattern = pattern
+                break
+        
+        if brand_position == -1:
+            logger.warning(f"Brand '{brand_name}' not found in text for sentiment analysis")
+            return None
+        
+        # Extract context: 100 characters before and after the brand mention
+        context_start = max(0, brand_position - 100)
+        context_end = min(len(full_text), brand_position + len(matched_pattern) + 100)
+        
+        context = full_text[context_start:context_end].strip()
+        
+        # Ensure we have meaningful context (at least the brand + some words)
+        if len(context) < len(matched_pattern) + 10:
+            # If context is too short, use a bit more
+            context_start = max(0, brand_position - 200)
+            context_end = min(len(full_text), brand_position + len(matched_pattern) + 200)
+            context = full_text[context_start:context_end].strip()
+        
+        logger.debug(f"📝 Brand context for '{brand_name}': '{context[:100]}...'")
+        return context
+    
+    def _backfill_missed_content(self, content_type: str, gap_start: datetime, gap_end: datetime):
+        """Intelligent backfill to catch content missed during rate limit periods"""
+        try:
+            logger.info(f"🔄 Starting backfill for {content_type} from {gap_start} to {gap_end}")
+            
+            # Calculate gap duration
+            gap_duration = (gap_end - gap_start).total_seconds()
+            if gap_duration < 30:  # Don't backfill very short gaps
+                logger.info(f"⏭️ Skipping backfill - gap too short ({gap_duration}s)")
+                return
+            
+            # Use JSON API for backfill (more reliable than PRAW for historical data)
+            if content_type == "comments":
+                self._backfill_comments_json(gap_start, gap_end)
+            elif content_type == "posts":
+                self._backfill_posts_json(gap_start, gap_end)
+                
+        except Exception as e:
+            logger.error(f"❌ Backfill error for {content_type}: {e}")
+    
+    def _backfill_comments_json(self, gap_start: datetime, gap_end: datetime):
+        """Backfill comments using JSON API"""
+        try:
+            # Use focused subreddits for backfill to reduce load
+            subreddits_to_check = self.config.get('focused_subreddits', [])[:5]  # Limit to top 5
+            
+            for subreddit in subreddits_to_check:
+                url = f"https://www.reddit.com/r/{subreddit}/comments.json?limit=100&sort=new"
+                
+                try:
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        comments_found = 0
+                        
+                        for item in data.get('data', {}).get('children', []):
+                            comment_data = item.get('data', {})
+                            created_time = datetime.fromtimestamp(comment_data.get('created_utc', 0), tz=timezone.utc)
+                            
+                            # Check if comment falls within gap period
+                            if gap_start <= created_time <= gap_end:
+                                comment_body = comment_data.get('body', '')
+                                brands = self.find_brands(comment_body)
+                                
+                                if brands:
+                                    comments_found += 1
+                                    # Process as normal mention
+                                    for brand in brands:
+                                        logger.info(f"🔄 Backfilled comment mention: {brand} in r/{subreddit}")
+                        
+                        if comments_found > 0:
+                            logger.info(f"✅ Backfilled {comments_found} comments from r/{subreddit}")
+                            
+                except Exception as e:
+                    logger.error(f"❌ Backfill error for r/{subreddit} comments: {e}")
+                    
+                time.sleep(1)  # Rate limiting for backfill
+                
+        except Exception as e:
+            logger.error(f"❌ Comment backfill error: {e}")
+    
+    def _backfill_posts_json(self, gap_start: datetime, gap_end: datetime):
+        """Backfill posts using JSON API"""
+        try:
+            # Use focused subreddits for backfill
+            subreddits_to_check = self.config.get('focused_subreddits', [])[:5]  # Limit to top 5
+            
+            for subreddit in subreddits_to_check:
+                url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=100"
+                
+                try:
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        posts_found = 0
+                        
+                        for item in data.get('data', {}).get('children', []):
+                            post_data = item.get('data', {})
+                            created_time = datetime.fromtimestamp(post_data.get('created_utc', 0), tz=timezone.utc)
+                            
+                            # Check if post falls within gap period
+                            if gap_start <= created_time <= gap_end:
+                                full_text = f"{post_data.get('title', '')} {post_data.get('selftext', '')}"
+                                brands = self.find_brands(full_text)
+                                
+                                if brands:
+                                    posts_found += 1
+                                    # Process as normal mention
+                                    for brand in brands:
+                                        logger.info(f"🔄 Backfilled post mention: {brand} in r/{subreddit}")
+                        
+                        if posts_found > 0:
+                            logger.info(f"✅ Backfilled {posts_found} posts from r/{subreddit}")
+                            
+                except Exception as e:
+                    logger.error(f"❌ Backfill error for r/{subreddit} posts: {e}")
+                    
+                time.sleep(1)  # Rate limiting for backfill
+                
+        except Exception as e:
+            logger.error(f"❌ Post backfill error: {e}")
+     
+    async def monitor_focused_subreddits(self):
+        """Monitor high-priority subreddits for extra coverage"""
+        logger.info("Starting focused subreddits monitoring...")
+        
+        while self.running:
+            try:
+                for subreddit in self.config.get('focused_subreddits', []):
+                    if not self.running:
+                        break
+                    
+                    # Monitor posts for each focused subreddit (comments handled by JSON chunked monitoring)
+                    await self._monitor_subreddit_posts(subreddit)
+                    
+                    # Small delay between monitoring different content types
+                    await asyncio.sleep(1)
+                    
+                    await asyncio.sleep(3)  # Delay between subreddits
+                
+                # Flush buffer if needed
+                if self.mention_buffer:
+                    await self.process_mention_buffer()
+                
+                await asyncio.sleep(120)  # Check focused subreddits every 2 minutes
+                
+            except Exception as e:
+                logger.error(f"Focused subreddits monitoring error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _monitor_subreddit_posts(self, subreddit: str):
+        """Monitor posts in a specific subreddit"""
+        try:
+            url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25"
+            
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                await self._process_subreddit_posts(data, subreddit)
+            elif response.status_code == 429:
+                logger.warning(f"Rate limited for r/{subreddit}")
+                await asyncio.sleep(30)
+                        
+        except Exception as e:
+            logger.error(f"Error monitoring r/{subreddit} posts: {e}")
+    
+    def _monitor_json_comments_chunked(self):
+        """Enhanced JSON comment monitoring with chunking and robust error handling"""
+        logger.info("📡 Enhanced JSON comment poller started...")
+        import requests
+        import random
+        
+        session = requests.Session()
+        session.headers.update({"User-Agent": "BrandMentionMonitor/1.0 by AllInOneRedditMonitor"})
+        seen_json_ids = set()
+        chunk_size = 5  # Process subreddits in chunks
+        base_delay = 15
+        
+        subreddits = self.config.get('focused_subreddits', [])
+        
+        while self.running:
+            try:
+                for i in range(0, len(subreddits), chunk_size):
+                    if not self.running:
+                        break
+                        
+                    chunk = subreddits[i:i + chunk_size]
+                    chunk_str = "+".join(chunk)
+                    url = f"https://www.reddit.com/r/{chunk_str}/comments.json?limit=100"
+                    
+                    try:
+                        response = session.get(url, timeout=10)
+                        if response.status_code == 429:
+                            logger.warning(f"❌ 429 Too Many Requests on chunk: {chunk_str}")
+                            time.sleep(30)
+                            continue
+                        response.raise_for_status()
+                        
+                        data = response.json()
+                        children = data.get("data", {}).get("children", [])
+                        
+                        for item in children:
+                            if not self.running:
+                                break
+                                
+                            c = item.get("data", {})
+                            cid = c.get("id")
+                            if not c or cid in seen_json_ids:
+                                continue
+                                
+                            body = c.get("body", "")
+                            if len(body) < 20:
+                                continue
+                            
+                            # Check for brand mentions
+                            for brand_name, brand_pattern in self.brands.items():
+                                if brand_pattern.search(body):
+                                    # Analyze sentiment IMMEDIATELY
+                                    context = self._extract_simple_context(body, brand_name)
+                                    try:
+                                        sentiment = self.sentiment.analyze(context, brand_name)
+                                        logger.info(f"💭 Analyzed JSON sentiment for '{brand_name}': {sentiment}")
+                                    except Exception as e:
+                                        sentiment = "neutral"
+                                        logger.warning(f"JSON sentiment analysis failed for {brand_name}: {e}")
+                                    
+                                    # Use actual Reddit comment ID (e.g., n3z93h6)
+                                    reddit_id = c.get('id')
+                                    if not reddit_id:
+                                        logger.warning("❌ No Reddit ID found in JSON data")
+                                        continue
+                                    mention_id = reddit_id  # Use actual Reddit ID directly
+                                    
+                                    # Check for duplicates using both ID and content  
+                                    content_hash = f"{brand_name}_{c.get('subreddit', 'unknown')}_{hash(body[:100])}"
+                                    
+                                    is_duplicate = (mention_id in self.seen_ids or 
+                                                   mention_id in self.seen_core_ids or 
+                                                   content_hash in self.seen_content)
+                                    
+                                    if is_duplicate:
+                                        logger.debug(f"⏭️ Skipped duplicate JSON mention: ID={mention_id in self.seen_ids}, CoreID={mention_id in self.seen_core_ids}, Content={content_hash in self.seen_content}")
+                                        continue
+                                    
+                                    # Create Mention object and save IMMEDIATELY
+                                    mention_obj = Mention(
+                                        id=mention_id,
+                                        type="comment",
+                                        title=f"Comment in r/{c.get('subreddit', 'unknown')}",
+                                        body=body,
+                                        permalink=f"https://reddit.com{c.get('permalink', '')}",
+                                        created=datetime.fromtimestamp(c.get('created_utc', time.time())).isoformat(),
+                                        subreddit=f"r/{c.get('subreddit', 'unknown')}",
+                                        author=c.get('author', 'unknown'),
+                                        score=c.get('score', 0),
+                                        sentiment=sentiment,  # Set analyzed sentiment
+                                        brand=brand_name,
+                                        source="json_chunked_monitoring"
+                                    )
+                                    
+                                    # Save to database IMMEDIATELY
+                                    self.db.insert_mentions([mention_obj])
+                                    self.seen_ids.add(mention_id)  # Add to seen_ids to prevent duplicates
+                                    self.seen_core_ids.add(mention_id)  # Add to seen_core_ids to prevent duplicates
+                                    self.seen_content.add(content_hash)  # Add to seen_content to prevent duplicates
+                                    seen_json_ids.add(cid)
+                                    logger.info(f"✅ Saved JSON mention: {brand_name} in r/{c.get('subreddit')} with sentiment: {sentiment}")
+                    
+                    except requests.exceptions.ConnectionError as e:
+                        logger.warning(f"❌ Connection error for chunk {chunk_str}: {e}")
+                        backoff = random.randint(20, 40)
+                        logger.info(f"⏳ Backing off for {backoff} seconds...")
+                        time.sleep(backoff)
+                    except requests.exceptions.HTTPError as e:
+                        if response.status_code >= 500:
+                            logger.warning(f"❌ 5xx server error for chunk {chunk_str}: {e}")
+                            backoff = random.randint(25, 60)
+                            logger.info(f"⏳ Backing off for {backoff} seconds...")
+                            time.sleep(backoff)
+                        else:
+                            logger.error(f"❌ HTTP error on chunk {chunk_str}: {e}")
+                    except Exception as e:
+                        logger.error(f"❌ Unknown error on chunk {chunk_str}: {e}")
+                    
+                    time.sleep(base_delay)
+                    
+                    # Process JSON mention buffer periodically
+                    if self.json_mention_buffer:
+                        logger.info(f"💾 Processing {len(self.json_mention_buffer)} JSON mentions from buffer...")
+                        self._process_json_buffer_with_sentiment()
+                        self.json_mention_buffer.clear()
+                    
+            except Exception as e:
+                logger.error(f"JSON comment monitoring error: {e}")
+                time.sleep(60)  # Wait before retrying
+                
+            # Process any remaining JSON mentions in buffer at end of cycle
+            if self.json_mention_buffer:
+                logger.info(f"💾 End-of-cycle: Processing {len(self.json_mention_buffer)} JSON mentions from buffer...")
+                self._process_json_buffer_with_sentiment()
+                self.json_mention_buffer.clear()
+    
+    async def _process_subreddit_posts(self, data: dict, subreddit: str):
+        """Process posts from focused subreddit monitoring"""
+        try:
+            if 'data' in data and 'children' in data['data']:
+                for item in data['data']['children']:
+                    if not self.running:
+                        break
+                    
+                    post_data = item['data']
+                    post_id = post_data.get('id')
+                    
+                    if post_id in self.seen_ids:
+                        continue
+                    
+                    title = post_data.get('title', '')
+                    selftext = post_data.get('selftext', '')
+                    full_text = f"{title} {selftext}"
+                    
+                    brands = self.find_brands(full_text)
+                    if brands:
+                        for brand in brands:
+                            mention = Mention(
+                                id=post_id,
+                                type="post",
+                                title=title,
+                                body=selftext,
+                                permalink=f"https://reddit.com{post_data.get('permalink', '')}",
+                                created=datetime.fromtimestamp(post_data.get('created_utc', 0), tz=timezone.utc).isoformat(),
+                                subreddit=subreddit,
+                                author=post_data.get('author', 'unknown'),
+                                score=post_data.get('score', 0),
+                                sentiment=None,
+                                brand=brand,
+                                source="focused_subreddit"
+                            )
+                            
+                            self.mention_buffer.append(mention)
+                            self.seen_ids.add(post_id)
+                            logger.info(f"Found focused mention: {brand} in r/{subreddit} (post)")
+                            
+        except Exception as e:
+            logger.error(f"Focused subreddit posts processing error: {e}")
+
     def stop_monitoring(self):
         """Stop monitoring"""
         self.running = False
@@ -477,17 +1276,36 @@ app = Flask(__name__)
 db_manager = None
 reddit_monitor = None
 
+@app.route('/debug-info')
+def debug_info():
+    """Debug route to test if new routes are working"""
+    return jsonify({
+        "status": "SUCCESS - New routes are working!",
+        "timestamp": datetime.utcnow().isoformat(),
+        "message": "If you can see this, the deployment picked up our changes",
+        "backfill_available": True
+    })
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 @app.route('/health')
 def health():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "monitoring": reddit_monitor.running if reddit_monitor else False
-    })
+    try:
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "monitoring": reddit_monitor.running if reddit_monitor else False,
+            "port": CONFIG['port']
+        })
+    except Exception as e:
+        # Return basic health check even if reddit_monitor isn't ready
+        return jsonify({
+            "status": "starting",
+            "timestamp": datetime.utcnow().isoformat(),
+            "error": str(e)
+        })
 
 @app.route('/data')
 def get_mentions():
@@ -497,159 +1315,203 @@ def get_mentions():
     
     # Build query
     offset = (page - 1) * per_page
-    query = '''
-        SELECT * FROM mentions 
-        WHERE brand = ? 
-        ORDER BY created DESC 
-        LIMIT ? OFFSET ?
-    '''
     
-    mentions = db_manager.execute_query(query, (brand, per_page, offset))
+    with db_manager.get_connection() as conn:
+        if brand:
+            query = '''
+                SELECT id, type, title, body, permalink, created, subreddit, author, score, sentiment, brand, source
+                FROM mentions 
+                WHERE brand = ?
+                ORDER BY created DESC 
+                LIMIT ? OFFSET ?
+            '''
+            cursor = conn.execute(query, (brand, per_page, offset))
+        else:
+            query = '''
+                SELECT id, type, title, body, permalink, created, subreddit, author, score, sentiment, brand, source
+                FROM mentions 
+                ORDER BY created DESC 
+                LIMIT ? OFFSET ?
+            '''
+            cursor = conn.execute(query, (per_page, offset))
+        
+        mentions = cursor.fetchall()
     
-    return jsonify({
-        "results": [dict(row) for row in mentions],
-        "pagination": {"page": page, "per_page": per_page}
-    })
+    # Convert to list of dicts
+    results = []
+    for mention in mentions:
+        results.append({
+            'id': mention[0],
+            'type': mention[1],
+            'title': mention[2],
+            'body': mention[3],
+            'permalink': mention[4],
+            'created': mention[5],
+            'subreddit': mention[6],
+            'author': mention[7],
+            'score': mention[8],
+            'sentiment': mention[9],
+            'brand': mention[10],
+            'source': mention[11]
+        })
+    
+    return jsonify(results)
 
 @app.route('/stats')
 def get_stats():
     brand = request.args.get('brand', list(CONFIG['brands'].keys())[0])
+    tz_offset = int(request.args.get('tz_offset', 0))
     
-    # Today's stats
-    today = datetime.now().strftime('%Y-%m-%d')
-    daily_query = '''
-        SELECT 
-            COUNT(CASE WHEN type = 'post' THEN 1 END) as posts,
-            COUNT(CASE WHEN type = 'comment' THEN 1 END) as comments
-        FROM mentions 
-        WHERE brand = ? AND date(created) = ?
-    '''
-    daily_stats = db_manager.execute_query(daily_query, (brand, today))[0]
+    with db_manager.get_connection() as conn:
+        # Daily stats
+        daily_query = '''
+            SELECT type, COUNT(*) 
+            FROM mentions 
+            WHERE brand = ? AND DATE(created) = DATE('now') 
+            GROUP BY type
+        '''
+        daily_cursor = conn.execute(daily_query, (brand,))
+        daily_results = dict(daily_cursor.fetchall())
+        
+        # Total stats
+        total_query = '''
+            SELECT type, COUNT(*) 
+            FROM mentions 
+            WHERE brand = ? 
+            GROUP BY type
+        '''
+        total_cursor = conn.execute(total_query, (brand,))
+        total_results = dict(total_cursor.fetchall())
+        
+        # Sentiment stats
+        sentiment_query = '''
+            SELECT sentiment, COUNT(*) 
+            FROM mentions 
+            WHERE brand = ? AND sentiment IS NOT NULL 
+            GROUP BY sentiment
+        '''
+        sentiment_cursor = conn.execute(sentiment_query, (brand,))
+        sentiment_results = dict(sentiment_cursor.fetchall())
     
-    # Total stats
-    total_query = '''
-        SELECT 
-            COUNT(CASE WHEN type = 'post' THEN 1 END) as posts,
-            COUNT(CASE WHEN type = 'comment' THEN 1 END) as comments
-        FROM mentions 
-        WHERE brand = ?
-    '''
-    total_stats = db_manager.execute_query(total_query, (brand,))[0]
-    
-    # Sentiment stats
-    sentiment_query = '''
-        SELECT sentiment, COUNT(*) as count
-        FROM mentions 
-        WHERE brand = ? AND sentiment IS NOT NULL
-        GROUP BY sentiment
-    '''
-    sentiment_stats = {row[0]: row[1] for row in db_manager.execute_query(sentiment_query, (brand,))}
-    
-    # Calculate sentiment score
-    pos = sentiment_stats.get('positive', 0)
-    neu = sentiment_stats.get('neutral', 0)
-    neg = sentiment_stats.get('negative', 0)
-    total = pos + neu + neg
-    score = round((pos * 100 + neu * 50) / total) if total > 0 else 0
+    # Calculate score (simple sentiment-based scoring)
+    total_sentiment = sum(sentiment_results.values())
+    if total_sentiment > 0:
+        positive_ratio = sentiment_results.get('positive', 0) / total_sentiment
+        negative_ratio = sentiment_results.get('negative', 0) / total_sentiment
+        score = max(0, min(100, int((positive_ratio - negative_ratio + 1) * 50)))
+    else:
+        score = 50  # Neutral when no sentiment data
     
     return jsonify({
-        "brand": brand,
-        "daily": {"posts": daily_stats[0], "comments": daily_stats[1]},
-        "total": {"posts": total_stats[0], "comments": total_stats[1]},
-        "sentiment": {"positive": pos, "neutral": neu, "negative": neg},
-        "score": score
+        'brand': brand,
+        'daily': {
+            'posts': daily_results.get('post', 0),
+            'comments': daily_results.get('comment', 0)
+        },
+        'total': {
+            'posts': total_results.get('post', 0),
+            'comments': total_results.get('comment', 0)
+        },
+        'sentiment': {
+            'positive': sentiment_results.get('positive', 0),
+            'negative': sentiment_results.get('negative', 0),
+            'neutral': sentiment_results.get('neutral', 0)
+        },
+        'score': score
     })
 
 @app.route('/trending_subreddits')
 def trending_subreddits():
-    brand = request.args.get('brand', list(CONFIG['brands'].keys())[0])
-    days = int(request.args.get('days', 7))
+    brand = request.args.get('brand')
     
-    cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    
-    query = '''
-        SELECT 
-            subreddit,
-            COUNT(*) as mention_count,
-            AVG(score) as avg_score,
-            COUNT(CASE WHEN sentiment = 'positive' THEN 1 END) as positive,
-            COUNT(CASE WHEN sentiment = 'negative' THEN 1 END) as negative
-        FROM mentions 
-        WHERE brand = ? AND date(created) >= ?
-        GROUP BY subreddit
-        ORDER BY mention_count DESC
-        LIMIT 10
-    '''
-    
-    results = db_manager.execute_query(query, (brand, cutoff_date))
+    with db_manager.get_connection() as conn:
+        if brand:
+            query = '''
+                SELECT subreddit, COUNT(*) as mention_count, GROUP_CONCAT(DISTINCT brand) as brands
+                FROM mentions 
+                WHERE brand = ?
+                GROUP BY subreddit 
+                ORDER BY mention_count DESC 
+                LIMIT 20
+            '''
+            cursor = conn.execute(query, (brand,))
+        else:
+            query = '''
+                SELECT subreddit, COUNT(*) as mention_count, GROUP_CONCAT(DISTINCT brand) as brands
+                FROM mentions 
+                GROUP BY subreddit 
+                ORDER BY mention_count DESC 
+                LIMIT 20
+            '''
+            cursor = conn.execute(query)
+        
+        results = cursor.fetchall()
     
     trending = []
-    for row in results:
-        subreddit, count, avg_score, pos, neg = row
+    for subreddit, count, brands in results:
         trending.append({
-            "subreddit": subreddit,
-            "mention_count": count,
-            "avg_score": float(avg_score) if avg_score else 0,
-            "positive_mentions": pos,
-            "negative_mentions": neg,
-            "sentiment_ratio": pos / (pos + neg) if (pos + neg) > 0 else 0.5
+            'subreddit': subreddit,
+            'mention_count': count,
+            'brands': brands.split(',') if brands else []
         })
     
     return jsonify(trending)
 
 @app.route('/export')
-def export_data():
-    brand = request.args.get('brand', list(CONFIG['brands'].keys())[0])
+def export_mentions():
+    brand = request.args.get('brand')
     
-    query = '''
-        SELECT * FROM mentions 
-        WHERE brand = ? 
-        ORDER BY created DESC 
-        LIMIT 5000
-    '''
-    
-    mentions = db_manager.execute_query(query, (brand,))
+    with db_manager.get_connection() as conn:
+        if brand:
+            query = "SELECT * FROM mentions WHERE brand = ? ORDER BY created DESC"
+            cursor = conn.execute(query, (brand,))
+        else:
+            query = "SELECT * FROM mentions ORDER BY created DESC"
+            cursor = conn.execute(query)
+        
+        mentions = cursor.fetchall()
     
     # Create CSV
     output = io.StringIO()
     writer = csv.writer(output)
     
-    # Header
-    if mentions:
-        writer.writerow(mentions[0].keys())
-        
-        # Data
-        for mention in mentions:
-            writer.writerow(mention)
+    # Write header
+    writer.writerow(['ID', 'Type', 'Title', 'Body', 'Permalink', 'Created', 'Subreddit', 'Author', 'Score', 'Sentiment', 'Brand', 'Source'])
     
-    output.seek(0)
+    # Write data
+    for mention in mentions:
+        writer.writerow(mention)
+    
+    # Create file response
+    csv_output = output.getvalue()
+    output.close()
     
     return send_file(
-        io.BytesIO(output.getvalue().encode('utf-8')),
-        mimetype='text/csv',
+        io.BytesIO(csv_output.encode('utf-8')),
         as_attachment=True,
-        download_name=f'{brand}_mentions_{datetime.now().strftime("%Y%m%d")}.csv'
+        download_name=f'reddit_mentions_{brand or "all"}_{datetime.now().strftime("%Y%m%d")}.csv',
+        mimetype='text/csv'
     )
 
 @app.route('/system_status')
 def system_status():
-    # Database stats
-    total_mentions = db_manager.execute_query("SELECT COUNT(*) FROM mentions")[0][0]
-    total_brands = len(CONFIG['brands'])
-    
-    # Source breakdown
-    source_query = '''
-        SELECT source, COUNT(*), MAX(created) as last_update
-        FROM mentions 
-        GROUP BY source
-    '''
-    sources = []
-    for row in db_manager.execute_query(source_query):
-        sources.append({
-            "source": row[0],
-            "count": row[1],
-            "last_update": row[2]
-        })
+    with db_manager.get_connection() as conn:
+        # Get total mentions
+        total_cursor = conn.execute("SELECT COUNT(*) FROM mentions")
+        total_mentions = total_cursor.fetchone()[0]
+        
+        # Get total brands
+        brands_cursor = conn.execute("SELECT COUNT(DISTINCT brand) FROM mentions")
+        total_brands = brands_cursor.fetchone()[0]
+        
+        # Get data sources
+        source_query = '''
+            SELECT source, COUNT(*) as count 
+            FROM mentions 
+            GROUP BY source
+        '''
+        source_cursor = conn.execute(source_query)
+        sources = dict(source_cursor.fetchall())
     
     return jsonify({
         "total_mentions": total_mentions,
@@ -676,501 +1538,568 @@ def delete_mention():
     
     return jsonify({"status": "deleted", "id": mention_id})
 
-# HTML Template (embedded)
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204  # No content, prevents 404 errors
+
+@app.route('/download')
+def download_csv():
+    """Download mentions for current brand as CSV with specific format"""
+    brand = request.args.get('brand')
+    
+    with db_manager.get_connection() as conn:
+        if brand:
+            query = "SELECT type, subreddit, author, permalink, created, title, body, sentiment FROM mentions WHERE brand = ? ORDER BY created DESC"
+            cursor = conn.execute(query, (brand,))
+        else:
+            query = "SELECT type, subreddit, author, permalink, created, title, body, sentiment FROM mentions ORDER BY created DESC"
+            cursor = conn.execute(query)
+        
+        mentions = cursor.fetchall()
+    
+    # Create CSV output
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter='\t')  # Using tab delimiter as requested
+    
+    # Write header with requested format
+    writer.writerow(['Type', 'Subreddit', 'Author', 'Link', 'Created', 'Preview', 'Sentiment'])
+    
+    # Write data
+    for mention in mentions:
+        type_val, subreddit, author, permalink, created, title, body, sentiment = mention
+        # Create preview from body (actual content) or title
+        preview = body if body else (title if title else "")
+        # Truncate preview if too long
+        if len(preview) > 200:
+            preview = preview[:200] + "..."
+        
+        writer.writerow([
+            type_val,
+            subreddit,
+            author,
+            f"https://reddit.com{permalink}" if permalink and not permalink.startswith('http') else permalink,
+            created,
+            preview,
+            sentiment or "neutral"
+        ])
+    
+    # Create response
+    csv_output = output.getvalue()
+    output.close()
+    
+    response = app.response_class(
+        csv_output,
+        mimetype='text/csv',
+        headers={
+            'Content-Disposition': f'attachment; filename=reddit_mentions_{brand or "all"}_{datetime.now().strftime("%Y%m%d")}.csv'
+        }
+    )
+    
+    return response
+
+@app.route('/test-route')
+def test_route():
+    """Simple test route to verify Flask routing is working"""
+    return jsonify({"status": "success", "message": "Flask routing is working!", "timestamp": datetime.utcnow().isoformat()})
+
+@app.route('/backfill/<subreddit>')
+def backfill_subreddit(subreddit):
+    """Manually backfill recent mentions from a specific subreddit"""
+    print(f"🔄 Backfill requested for subreddit: {subreddit}")
+    try:
+        # Get recent posts from the subreddit (last 25 posts)
+        import praw
+        
+        reddit = praw.Reddit(
+            client_id=CONFIG['reddit']['client_id'],
+            client_secret=CONFIG['reddit']['client_secret'],
+            user_agent=CONFIG['reddit']['user_agent']
+        )
+        
+        found_mentions = 0
+        processed = 0
+        
+        # Check recent posts
+        for submission in reddit.subreddit(subreddit).new(limit=25):
+            processed += 1
+            # Check if this post contains brand mentions
+            for brand_name, brand_pattern_str in CONFIG['brands'].items():
+                title_text = f"{submission.title} {submission.selftext}"
+                brand_pattern = re.compile(brand_pattern_str, re.IGNORECASE)
+                if brand_pattern.search(title_text):
+                    # This is a brand mention - save it
+                    db_manager.add_mention(
+                        brand_name, submission.title, title_text[:500], 
+                        f"r/{subreddit}", f"https://reddit.com{submission.permalink}",
+                        "neutral", submission.created_utc
+                    )
+                    found_mentions += 1
+                    
+            # Check recent comments on this post
+            submission.comments.replace_more(limit=0)
+            for comment in submission.comments.list()[:10]:  # Latest 10 comments
+                for brand_name, brand_pattern_str in CONFIG['brands'].items():
+                    brand_pattern = re.compile(brand_pattern_str, re.IGNORECASE)
+                    if brand_pattern.search(comment.body):
+                        db_manager.add_mention(
+                            brand_name, f"Comment on: {submission.title}", 
+                            comment.body[:500], f"r/{subreddit}",
+                            f"https://reddit.com{comment.permalink}",
+                            "neutral", comment.created_utc
+                        )
+                        found_mentions += 1
+        
+        return jsonify({
+            "status": "success",
+            "processed": processed,
+            "found_mentions": found_mentions,
+            "subreddit": subreddit
+        })
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/weekly_mentions')
+def weekly_mentions():
+    """Get weekly mention counts for charts"""
+    brand = request.args.get('brand', 'badinka')
+    tz = request.args.get('tz', 'UTC')
+    week_offset = int(request.args.get('week_offset', 0))
+    
+    # Calculate the start of the week (Monday)
+    today = datetime.now()
+    days_since_monday = today.weekday()
+    monday = today - timedelta(days=days_since_monday) + timedelta(weeks=week_offset)
+    monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Get mentions for the week
+    with db_manager.get_connection() as conn:
+        query = '''
+            SELECT DATE(created) as date, COUNT(*) as count
+            FROM mentions 
+            WHERE brand = ? 
+            AND created >= ? 
+            AND created < ?
+            GROUP BY DATE(created)
+            ORDER BY date
+        '''
+        
+        start_date = monday.isoformat()
+        end_date = (monday + timedelta(days=7)).isoformat()
+        
+        cursor = conn.execute(query, (brand, start_date, end_date))
+        results = cursor.fetchall()
+    
+    # Convert to dictionary format expected by frontend
+    weekly_data = {}
+    for date_str, count in results:
+        # Convert to frontend format (YYYY-MM-DD)
+        weekly_data[date_str] = count
+    
+    return jsonify(weekly_data)
+
+@app.route('/re-evaluate-sentiment')
+def re_evaluate_sentiment():
+    """Re-evaluate sentiment for all existing entries using Groq"""
+    if not reddit_monitor or not reddit_monitor.sentiment:
+        return jsonify({"error": "Sentiment analyzer not available"}), 500
+    
+    try:
+        with db_manager.get_connection() as conn:
+            # Get all entries that need re-evaluation
+            cursor = conn.execute("""
+                SELECT id, title, body, brand 
+                FROM mentions 
+                ORDER BY created DESC
+            """)
+            entries = cursor.fetchall()
+        
+        if not entries:
+            return jsonify({"message": "No entries found to re-evaluate", "updated": 0})
+        
+        updated_count = 0
+        total_count = len(entries)
+        
+        # Process in batches to avoid overwhelming the API
+        batch_size = 10
+        
+        for i in range(0, len(entries), batch_size):
+            batch = entries[i:i + batch_size]
+            
+            for entry_id, title, body, brand in batch:
+                try:
+                    # Create context text from title and body
+                    context_text = f"{title or ''} {body or ''}".strip()
+                    
+                    if context_text and len(context_text) > 10:
+                        # Use the new Groq sentiment analysis
+                        new_sentiment = reddit_monitor.sentiment.analyze(context_text, brand)
+                        
+                        # Update the database
+                        with db_manager.get_connection() as conn:
+                            conn.execute("""
+                                UPDATE mentions 
+                                SET sentiment = ? 
+                                WHERE id = ?
+                            """, (new_sentiment, entry_id))
+                            conn.commit()
+                        
+                        updated_count += 1
+                        
+                        # Log progress every 50 updates
+                        if updated_count % 50 == 0:
+                            print(f"🔄 Re-evaluated {updated_count}/{total_count} entries...")
+                    
+                except Exception as e:
+                    print(f"❌ Error re-evaluating entry {entry_id}: {e}")
+                    continue
+            
+            # Small delay between batches to be nice to the API
+            import time
+            time.sleep(2)
+        
+        return jsonify({
+            "message": f"Successfully re-evaluated sentiment for {updated_count} entries",
+            "updated": updated_count,
+            "total": total_count,
+            "success_rate": f"{(updated_count/total_count)*100:.1f}%" if total_count > 0 else "0%"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Re-evaluation failed: {str(e)}"}), 500
+
+# HTML Template (embedded) - User's Preferred Version
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Reddit Brand Monitor - All-in-One</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-            background: #f8fafc; color: #334155; line-height: 1.6;
-        }
-        .header { 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white; padding: 2rem; text-align: center;
-        }
-        .header h1 { font-size: 2.5rem; margin-bottom: 0.5rem; }
-        .header p { opacity: 0.9; font-size: 1.1rem; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
-        .tabs { display: flex; gap: 0.5rem; margin-bottom: 2rem; flex-wrap: wrap; }
-        .tab { 
-            padding: 0.75rem 1.5rem; background: white; border: none; 
-            border-radius: 8px; cursor: pointer; font-weight: 500;
-            transition: all 0.2s; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .tab:hover { transform: translateY(-1px); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
-        .tab.active { background: #667eea; color: white; }
-        .stats-grid { 
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem; margin-bottom: 2rem;
-        }
-        .stat-card { 
-            background: white; padding: 1.5rem; border-radius: 12px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;
-        }
-        .stat-number { font-size: 2rem; font-weight: bold; color: #667eea; }
-        .stat-label { color: #64748b; margin-top: 0.5rem; font-size: 0.9rem; }
-        .content-section { 
-            background: white; border-radius: 12px; padding: 1.5rem;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 2rem;
-        }
-        .mentions-table { width: 100%; border-collapse: collapse; }
-        .mentions-table th, .mentions-table td { 
-            padding: 0.75rem; text-align: left; border-bottom: 1px solid #e2e8f0;
-        }
-        .mentions-table th { background: #f8fafc; font-weight: 600; }
-        .badge { 
-            padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.8rem;
-            font-weight: 500; text-transform: capitalize;
-        }
-        .badge.positive { background: #dcfce7; color: #166534; }
-        .badge.neutral { background: #f1f5f9; color: #475569; }
-        .badge.negative { background: #fecaca; color: #991b1b; }
-        .btn { 
-            padding: 0.5rem 1rem; border: none; border-radius: 6px;
-            cursor: pointer; font-weight: 500; transition: all 0.2s;
-            margin: 0.25rem;
-        }
-        .btn-primary { background: #667eea; color: white; }
-        .btn-primary:hover { background: #5a67d8; }
-        .btn-danger { background: #ef4444; color: white; font-size: 0.8rem; }
-        .btn-danger:hover { background: #dc2626; }
-        .filters { display: flex; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
-        .filter-input { 
-            padding: 0.5rem; border: 1px solid #d1d5db; border-radius: 6px;
-            font-size: 0.9rem;
-        }
-        .loading { text-align: center; padding: 2rem; color: #64748b; }
-        .charts-container { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
-        .chart-wrapper { text-align: center; }
-        .status-indicator { 
-            display: inline-block; width: 10px; height: 10px; border-radius: 50%;
-            margin-right: 5px;
-        }
-        .status-active { background: #22c55e; }
-        .status-inactive { background: #ef4444; }
-        @media (max-width: 768px) {
-            .charts-container { grid-template-columns: 1fr; }
-            .filters { flex-direction: column; }
-            .tabs { flex-direction: column; }
-            .stats-grid { grid-template-columns: 1fr; }
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <title>Reddit Brand Monitoring</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 20px; background-color: #f9f9f9; color: #333; max-width: 100%; overflow-x: hidden; }
+    h1, h2, h3 { color: #222; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; background-color: #fff; table-layout: fixed; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; word-wrap: break-word; overflow: hidden; }
+    th { background-color: #f0f0f0; }
+    button { padding: 6px 12px; font-size: 14px; cursor: pointer; border-radius: 4px; border: none; background-color: #007bff; color: white; }
+    button:disabled { background-color: #aaa; cursor: not-allowed; }
+    .badge { padding: 2px 6px; border-radius: 4px; color: white; font-size: 12px; text-transform: capitalize; }
+    .positive { background-color: limegreen; }
+    .neutral  { background-color: gray; }
+    .negative { background-color: red; }
+    #brand-buttons { margin-bottom: 20px; }
+    #brand-buttons button { margin-right: 10px; }
+    #stats-tab { display: none; }
+    .stats-container { display: flex; gap: 30px; align-items: flex-start; margin-top: 20px; }
+    .stat-block { flex: 1; background: #fff; padding: 16px; border: 1px solid #ddd; border-radius: 6px; }
+    .pdf-btn, .csv-btn { display: inline-block; margin-top: 10px; }
+    .score-label { font-weight: bold; color: white; padding: 4px 8px; border-radius: 4px; display: inline-block; }
+    .charts-table { width: 100%; table-layout: fixed; margin-top: 20px; }
+    .charts-table td { text-align: center; vertical-align: top; }
+    .charts-table canvas { width: 300px; height: 300px; }
+    #data-table th:nth-child(1) { width: 8%; } /* Type */
+    #data-table th:nth-child(2) { width: 12%; } /* Subreddit */
+    #data-table th:nth-child(3) { width: 12%; } /* Author */
+    #data-table th:nth-child(4) { width: 8%; } /* Link */
+    #data-table th:nth-child(5) { width: 15%; } /* Created */
+    #data-table th:nth-child(6) { width: 30%; } /* Preview */
+    #data-table th:nth-child(7) { width: 10%; } /* Sentiment */
+    #data-table th:nth-child(8) { width: 5%; } /* Action */
+  </style>
 </head>
 <body>
-    <div class="header">
-        <h1>Reddit Brand Monitor</h1>
-        <p>All-in-One Real-time Brand Monitoring Solution</p>
+  <h1>Reddit Brand Monitoring</h1>
+     <div id="brand-buttons">
+     <button id="btn-badinka" onclick="switchBrand('badinka')">Badinka</button>
+     <button id="btn-devilwalking" onclick="switchBrand('devilwalking')">Devil Walking</button>
+     <button id="btn-stats" onclick="showStats()">Stats</button>
+   </div>
+  <p class="csv-btn">
+    <button id="csv-btn" onclick="downloadCurrentBrandCSV()">📥 Download CSV</button>
+    <button id="pdf-btn" style="display:none;" onclick="downloadPDF()">📄 Download as PDF</button>
+    <button id="re-evaluate-btn" onclick="reEvaluateSentiment()" style="background-color: #28a745;">🔄 Re-evaluate All Sentiment</button>
+  </p>
+
+  <div id="mentions-tab">
+    <table id="data-table">
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Subreddit</th>
+          <th>Author</th>
+          <th>Link</th>
+          <th>Created</th>
+          <th>Preview</th>
+          <th>Sentiment</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div id="stats-tab">
+    <h2>Head to head stats</h2>
+    <div class="stats-container">
+      <div id="stats-left" class="stat-block"></div>
+      <div id="stats-right" class="stat-block"></div>
     </div>
+    <table class="charts-table">
+      <tr>
+        <td><canvas id="pie-left"></canvas></td>
+        <td><canvas id="pie-right"></canvas></td>
+      </tr>
+      <tr>
+        <td>
+          <div style="text-align: center; margin-top: 30px;">
+            <button onclick="changeWeek(-1)">⬅️ Previous Week</button>
+            <span id="week-label-left" style="margin: 0 20px; font-weight: bold;">This Week</span>
+            <button onclick="changeWeek(1)">Next Week ➡️</button>
+          </div>
+          <canvas id="bar-left" style="margin-top: 20px; height: 300px;"></canvas>
+        </td>
+        <td>
+          <div style="text-align: center; margin-top: 30px;">
+            <button onclick="changeWeek(-1)">⬅️ Previous Week</button>
+            <span id="week-label-right" style="margin: 0 20px; font-weight: bold;">This Week</span>
+            <button onclick="changeWeek(1)">Next Week ➡️</button>
+          </div>
+          <canvas id="bar-right" style="margin-top: 20px; height: 300px;"></canvas>
+        </td>
+      </tr>
+    </table>
+  </div>
 
-    <div class="container">
-        <div class="tabs">
-            <button class="tab active" onclick="showTab('dashboard')" id="tab-dashboard">Dashboard</button>
-            <button class="tab" onclick="showTab('mentions')" id="tab-mentions">Live Mentions</button>
-            <button class="tab" onclick="showTab('analytics')" id="tab-analytics">Analytics</button>
-            <button class="tab" onclick="showTab('settings')" id="tab-settings">Settings</button>
-        </div>
+  <script>
+    let currentBrand = "badinka";
+    let charts = {};
+    let barCharts = { left: null, right: null };
+    let weekOffset = 0;
 
-        <!-- Dashboard Tab -->
-        <div id="dashboard-tab" class="tab-content">
-            <div class="stats-grid" id="stats-container">
-                <div class="loading">Loading stats...</div>
-            </div>
-            
-            <div class="content-section">
-                <h3>Recent Activity</h3>
-                <div class="charts-container">
-                    <div class="chart-wrapper">
-                        <h4>Sentiment Distribution</h4>
-                        <canvas id="sentiment-chart" width="300" height="300"></canvas>
-                    </div>
-                    <div class="chart-wrapper">
-                        <h4>Brand Comparison</h4>
-                        <canvas id="brand-chart" width="300" height="300"></canvas>
-                    </div>
-                </div>
-            </div>
-        </div>
+         function switchBrand(brand) {
+       currentBrand = brand;
+       document.getElementById("mentions-tab").style.display = "block";
+       document.getElementById("stats-tab").style.display = "none";
+       document.getElementById("btn-badinka").disabled = (brand === "badinka");
+       document.getElementById("btn-devilwalking").disabled = (brand === "devilwalking");
+       document.getElementById("btn-stats").disabled = false;
+       document.getElementById("csv-btn").style.display = 'inline-block';
+       document.getElementById("pdf-btn").style.display = 'none';
+       loadData();
+     }
 
-        <!-- Mentions Tab -->
-        <div id="mentions-tab" class="tab-content" style="display: none;">
-            <div class="content-section">
-                <div class="filters">
-                    <select class="filter-input" id="brand-filter">
-                        <!-- Populated by JavaScript -->
-                    </select>
-                    <button class="btn btn-primary" onclick="loadMentions()">Refresh</button>
-                    <button class="btn btn-primary" onclick="exportData()">Export CSV</button>
-                </div>
+         function showStats() {
+       document.getElementById("mentions-tab").style.display = "none";
+       document.getElementById("stats-tab").style.display = "block";
+       document.getElementById("btn-badinka").disabled = false;
+       document.getElementById("btn-devilwalking").disabled = false;
+       document.getElementById("btn-stats").disabled = true;
+       document.getElementById("csv-btn").style.display = 'none';
+       document.getElementById("pdf-btn").style.display = 'inline-block';
+       loadStats();
+     }
 
-                <table class="mentions-table">
-                    <thead>
-                        <tr>
-                            <th>Type</th>
-                            <th>Subreddit</th>
-                            <th>Author</th>
-                            <th>Content</th>
-                            <th>Created</th>
-                            <th>Score</th>
-                            <th>Sentiment</th>
-                            <th>Source</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="mentions-tbody">
-                        <tr><td colspan="9" class="loading">Loading mentions...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
+    function changeWeek(offset) {
+      weekOffset += offset;
+      loadWeeklyCharts();
+    }
 
-        <!-- Analytics Tab -->
-        <div id="analytics-tab" class="tab-content" style="display: none;">
-            <div class="content-section">
-                <h3>Trending Subreddits</h3>
-                <div id="trending-container" class="loading">Loading trending data...</div>
-            </div>
-        </div>
+    function getMonday(offset) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const monday = new Date(today);
+      monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7) + 7 * offset);
+      return monday;
+    }
 
-        <!-- Settings Tab -->
-        <div id="settings-tab" class="tab-content" style="display: none;">
-            <div class="content-section">
-                <h3>System Status</h3>
-                <div id="status-container" class="loading">Loading system status...</div>
-            </div>
-            
-            <div class="content-section">
-                <h3>Configuration</h3>
-                <p><strong>Brands Tracked:</strong> <span id="brands-list"></span></p>
-                <p><strong>Subreddits Monitored:</strong> <span id="subreddits-count"></span></p>
-                <p><strong>Database:</strong> SQLite (embedded)</p>
-                <p><strong>Monitoring Status:</strong> <span id="monitoring-status"></span></p>
-            </div>
-        </div>
-    </div>
+    function updateWeekLabel(monday) {
+      const sunday = new Date(monday);
+      sunday.setDate(monday.getDate() + 6);
+      const label = `${monday.toLocaleDateString()} - ${sunday.toLocaleDateString()}`;
+      document.getElementById("week-label-left").textContent = label;
+      document.getElementById("week-label-right").textContent = label;
+    }
 
-    <script>
-        let currentBrand = '';
-        let brands = [];
-        let charts = {};
-
-        // Initialize
-        async function init() {
-            try {
-                // Load system status to get brands
-                const response = await fetch('/system_status');
-                const status = await response.json();
-                
-                // Set up brand filter
-                const brandFilter = document.getElementById('brand-filter');
-                brandFilter.innerHTML = '';
-                
-                // Get brands from config (we'll need to expose this)
-                brands = ['badinka', 'iheartraves']; // Default brands
-                brands.forEach(brand => {
-                    const option = document.createElement('option');
-                    option.value = brand;
-                    option.textContent = brand.charAt(0).toUpperCase() + brand.slice(1);
-                    brandFilter.appendChild(option);
-                });
-                
-                currentBrand = brands[0];
-                
-                // Update settings
-                document.getElementById('brands-list').textContent = brands.join(', ');
-                document.getElementById('subreddits-count').textContent = '10+ communities';
-                
-                const monitoringStatus = status.monitoring_active ? 
-                    '<span class="status-indicator status-active"></span>Active' :
-                    '<span class="status-indicator status-inactive"></span>Inactive';
-                document.getElementById('monitoring-status').innerHTML = monitoringStatus;
-                
-                loadDashboard();
-            } catch (error) {
-                console.error('Initialization error:', error);
-            }
-        }
-
-        // Tab management
-        function showTab(tabName) {
-            document.querySelectorAll('.tab-content').forEach(tab => tab.style.display = 'none');
-            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-            
-            document.getElementById(tabName + '-tab').style.display = 'block';
-            document.getElementById('tab-' + tabName).classList.add('active');
-            
-            if (tabName === 'dashboard') loadDashboard();
-            else if (tabName === 'mentions') loadMentions();
-            else if (tabName === 'analytics') loadAnalytics();
-            else if (tabName === 'settings') loadSystemStatus();
-        }
-
-        // Load dashboard
-        async function loadDashboard() {
-            try {
-                const promises = brands.map(brand => 
-                    fetch(`/stats?brand=${brand}`).then(r => r.json())
-                );
-                const statsArray = await Promise.all(promises);
-                
-                renderStats(statsArray);
-                renderCharts(statsArray);
-            } catch (error) {
-                console.error('Error loading dashboard:', error);
-            }
-        }
-
-        function renderStats(statsArray) {
-            const container = document.getElementById('stats-container');
-            
-            let totalMentions = 0;
-            let totalToday = 0;
-            let avgScore = 0;
-            
-            statsArray.forEach(stats => {
-                totalMentions += stats.total.posts + stats.total.comments;
-                totalToday += stats.daily.posts + stats.daily.comments;
-                avgScore += stats.score;
-            });
-            
-            avgScore = avgScore / statsArray.length;
-            
-            container.innerHTML = `
-                <div class="stat-card">
-                    <div class="stat-number">${totalToday}</div>
-                    <div class="stat-label">Today's Mentions</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">${totalMentions}</div>
-                    <div class="stat-label">Total Mentions</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">${Math.round(avgScore)}/100</div>
-                    <div class="stat-label">Avg Sentiment</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">${brands.length}</div>
-                    <div class="stat-label">Brands Tracked</div>
-                </div>
-            `;
-        }
-
-        function renderCharts(statsArray) {
-            // Sentiment pie chart for current brand
-            const currentStats = statsArray[0] || {sentiment: {positive: 0, neutral: 0, negative: 0}};
-            
-            const sentimentCtx = document.getElementById('sentiment-chart').getContext('2d');
-            if (charts.sentiment) charts.sentiment.destroy();
-            
-            charts.sentiment = new Chart(sentimentCtx, {
-                type: 'pie',
-                data: {
-                    labels: ['Positive', 'Neutral', 'Negative'],
-                    datasets: [{
-                        data: [
-                            currentStats.sentiment.positive, 
-                            currentStats.sentiment.neutral, 
-                            currentStats.sentiment.negative
-                        ],
-                        backgroundColor: ['#22c55e', '#64748b', '#ef4444']
-                    }]
-                },
-                options: { 
-                    responsive: true, 
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { position: 'bottom' }
-                    }
-                }
-            });
-
-            // Brand comparison chart
-            const brandCtx = document.getElementById('brand-chart').getContext('2d');
-            if (charts.brand) charts.brand.destroy();
-            
-            const brandData = statsArray.map((stats, index) => ({
-                brand: brands[index] || `Brand ${index + 1}`,
-                mentions: stats.total.posts + stats.total.comments
-            }));
-            
-            charts.brand = new Chart(brandCtx, {
-                type: 'bar',
-                data: {
-                    labels: brandData.map(d => d.brand),
-                    datasets: [{
-                        label: 'Total Mentions',
-                        data: brandData.map(d => d.mentions),
-                        backgroundColor: '#667eea'
-                    }]
-                },
-                options: { 
-                    responsive: true, 
-                    maintainAspectRatio: false,
-                    scales: {
-                        y: { beginAtZero: true }
-                    }
-                }
-            });
-        }
-
-        // Load mentions
-        async function loadMentions() {
-            const brand = document.getElementById('brand-filter').value;
-            
-            try {
-                const response = await fetch(`/data?brand=${brand}&per_page=50`);
-                const data = await response.json();
-                renderMentions(data.results || []);
-            } catch (error) {
-                console.error('Error loading mentions:', error);
-            }
-        }
-
-        function renderMentions(mentions) {
-            const tbody = document.getElementById('mentions-tbody');
-            
-            if (mentions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" class="loading">No mentions found</td></tr>';
-                return;
-            }
-            
-            tbody.innerHTML = mentions.map(mention => `
-                <tr>
-                    <td>${mention.type}</td>
-                    <td>r/${mention.subreddit}</td>
-                    <td>u/${mention.author}</td>
-                    <td>
-                        <div style="max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                            ${mention.title || mention.body || ''}
-                        </div>
-                        <a href="${mention.permalink}" target="_blank" style="font-size: 0.8rem; color: #667eea;">View →</a>
-                    </td>
-                    <td>${new Date(mention.created).toLocaleDateString()}</td>
-                    <td>${mention.score}</td>
-                    <td><span class="badge ${mention.sentiment || 'neutral'}">${mention.sentiment || 'neutral'}</span></td>
-                    <td>${mention.source}</td>
-                    <td>
-                        <button class="btn btn-danger" onclick="deleteMention('${mention.id}')">Delete</button>
-                    </td>
-                </tr>
-            `).join('');
-        }
-
-        // Load analytics
-        async function loadAnalytics() {
-            try {
-                const response = await fetch(`/trending_subreddits?brand=${currentBrand}`);
-                const trending = await response.json();
-                
-                const container = document.getElementById('trending-container');
-                container.innerHTML = `
-                    <table class="mentions-table">
-                        <thead>
-                            <tr>
-                                <th>Subreddit</th>
-                                <th>Mentions</th>
-                                <th>Avg Score</th>
-                                <th>Positive %</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${trending.map(item => `
-                                <tr>
-                                    <td>r/${item.subreddit}</td>
-                                    <td>${item.mention_count}</td>
-                                    <td>${item.avg_score.toFixed(1)}</td>
-                                    <td>${(item.sentiment_ratio * 100).toFixed(1)}%</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                `;
-            } catch (error) {
-                console.error('Error loading analytics:', error);
-            }
-        }
-
-        // Load system status
-        async function loadSystemStatus() {
-            try {
-                const response = await fetch('/system_status');
-                const status = await response.json();
-                
-                const container = document.getElementById('status-container');
-                container.innerHTML = `
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-number">${status.total_mentions}</div>
-                            <div class="stat-label">Total Mentions</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-number">${status.total_brands}</div>
-                            <div class="stat-label">Brands Tracked</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-number">${status.monitoring_active ? 'Active' : 'Inactive'}</div>
-                            <div class="stat-label">Monitoring Status</div>
-                        </div>
-                    </div>
-                    
-                    <h4>Data Sources</h4>
-                    <table class="mentions-table">
-                        <thead>
-                            <tr><th>Source</th><th>Total Mentions</th><th>Last Update</th></tr>
-                        </thead>
-                        <tbody>
-                            ${status.sources.map(source => `
-                                <tr>
-                                    <td>${source.source}</td>
-                                    <td>${source.count}</td>
-                                    <td>${source.last_update ? new Date(source.last_update).toLocaleString() : 'N/A'}</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                `;
-            } catch (error) {
-                console.error('Error loading system status:', error);
-            }
-        }
-
-        // Utility functions
-        async function deleteMention(id) {
-            if (!confirm('Are you sure you want to delete this mention?')) return;
-            
-            try {
-                await fetch('/delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id })
-                });
-                loadMentions();
-            } catch (error) {
-                console.error('Error deleting mention:', error);
-            }
-        }
-
-        function exportData() {
-            const brand = document.getElementById('brand-filter').value;
-            window.open(`/export?brand=${brand}`, '_blank');
-        }
-
-        // Initialize and auto-refresh
-        document.addEventListener('DOMContentLoaded', () => {
-            init();
-            setInterval(() => {
-                if (document.getElementById('dashboard-tab').style.display !== 'none') {
-                    loadDashboard();
-                }
-            }, 30000); // Refresh every 30 seconds
+    function loadData() {
+      fetch(`/data?brand=${currentBrand}`)
+        .then(res => res.json())
+        .then(data => {
+          const tbody = document.querySelector("#data-table tbody");
+          tbody.innerHTML = "";
+          data.sort((a, b) => new Date(b.created) - new Date(a.created));
+          data.forEach(item => {
+            const sentiment = item.sentiment || "neutral";
+            const badge = `<span class="badge ${sentiment}">${sentiment}</span>`;
+            const row = document.createElement("tr");
+            row.innerHTML = `
+              <td>${item.type}</td>
+              <td>${item.subreddit}</td>
+              <td>${item.author}</td>
+              <td><a href="${item.permalink}" target="_blank">View</a></td>
+              <td>${new Date(item.created).toLocaleString()}</td>
+              <td>${item.body || item.title || ""}</td>
+              <td>${badge}</td>
+              <td><button onclick="deleteEntry('${item.id}')">🗑️ Delete</button></td>`;
+            tbody.appendChild(row);
+          });
         });
-    </script>
+    }
+
+    function deleteEntry(id) {
+      if (!confirm("Are you sure you want to delete this entry?")) return;
+      fetch("/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      }).then(() => loadData());
+    }
+
+    function downloadCurrentBrandCSV() {
+      window.location.href = `/download?brand=${currentBrand}`;
+    }
+
+    function reEvaluateSentiment() {
+      if (!confirm("This will re-analyze ALL entries in the database with the new Groq sentiment analysis. This may take a few minutes. Continue?")) {
+        return;
+      }
+      
+      const button = document.getElementById('re-evaluate-btn');
+      const originalText = button.textContent;
+      button.textContent = '🔄 Processing...';
+      button.disabled = true;
+      
+      fetch('/re-evaluate-sentiment')
+        .then(response => response.json())
+        .then(data => {
+          if (data.error) {
+            alert(`Error: ${data.error}`);
+          } else {
+            alert(`✅ Success! ${data.message}\n\nUpdated: ${data.updated}/${data.total} entries\nSuccess rate: ${data.success_rate}`);
+            // Reload the current view to show updated sentiment
+            if (document.getElementById("mentions-tab").style.display !== "none") {
+              loadData();
+            } else {
+              loadStats();
+            }
+          }
+        })
+        .catch(error => {
+          alert(`Error: ${error.message}`);
+        })
+        .finally(() => {
+          button.textContent = originalText;
+          button.disabled = false;
+        });
+    }
+
+         function loadStats() {
+       const tzOffset = new Date().getTimezoneOffset();
+       fetch(`/stats?brand=badinka&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
+       fetch(`/stats?brand=devilwalking&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
+       loadWeeklyCharts();
+     }
+
+    function renderStats(data, side) {
+      const totalToday = data.daily.posts + data.daily.comments;
+      const totalAll = data.total.posts + data.total.comments;
+      const perception = data.score > 60 ? 'positive' : data.score >= 40 ? 'neutral' : 'negative';
+
+      const container = document.getElementById(`stats-${side}`);
+      container.innerHTML = `
+        <h3>${data.brand}</h3>
+        <table>
+          <tr><th colspan="2">Today</th></tr>
+          <tr><td>Posts</td><td>${data.daily.posts}</td></tr>
+          <tr><td>Comments</td><td>${data.daily.comments}</td></tr>
+          <tr><td><strong>Total Today</strong></td><td><strong>${totalToday}</strong></td></tr>
+          <tr><th colspan="2">All Time</th></tr>
+          <tr><td>Posts</td><td>${data.total.posts}</td></tr>
+          <tr><td>Comments</td><td>${data.total.comments}</td></tr>
+          <tr><td><strong>Total</strong></td><td><strong>${totalAll}</strong></td></tr>
+          <tr><th>Brand Perception Score</th><td><span class="score-label ${perception}"><strong>${data.score}/100</strong></span></td></tr>
+        </table>`;
+
+      const ctx = document.getElementById(`pie-${side}`).getContext("2d");
+      if (charts[side]) charts[side].destroy();
+      charts[side] = new Chart(ctx, {
+        type: "pie",
+        data: {
+          labels: ["Positive", "Neutral", "Negative"],
+          datasets: [{
+            data: [data.sentiment.positive, data.sentiment.neutral, data.sentiment.negative],
+            backgroundColor: ["limegreen", "gray", "red"]
+          }]
+        },
+        options: { plugins: { legend: { position: "bottom" } }, responsive: true }
+      });
+    }
+
+    function loadWeeklyCharts() {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const monday = getMonday(weekOffset);
+      updateWeekLabel(monday);
+
+      const days = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(monday);
+        d.setDate(monday.getDate() + i);
+        d.setHours(0, 0, 0, 0);
+        return d;
+      });
+
+      const labels = days.map(d => d.toLocaleDateString());
+      const keys = days.map(d => d.toLocaleDateString('en-CA'));  // en-CA = YYYY-MM-DD
+
+             Promise.all([
+         fetch(`/weekly_mentions?brand=badinka&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
+         fetch(`/weekly_mentions?brand=devilwalking&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
+       ]).then(([leftData, rightData]) => {
+        const leftValues = keys.map(key => leftData[key] || 0);
+        const rightValues = keys.map(key => rightData[key] || 0);
+        const maxY = Math.max(...leftValues, ...rightValues, 1);
+        drawBarChart("left", labels, leftValues, maxY);
+        drawBarChart("right", labels, rightValues, maxY);
+      });
+    }
+
+    function drawBarChart(side, labels, values, maxY) {
+      const ctx = document.getElementById(`bar-${side}`).getContext("2d");
+      if (barCharts[side]) barCharts[side].destroy();
+      barCharts[side] = new Chart(ctx, {
+        type: "bar",
+        data: {
+          labels: labels,
+          datasets: [{
+            label: "Mentions",
+            data: values,
+            backgroundColor: "#007bff"
+          }]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            y: { beginAtZero: true, max: maxY, title: { display: true, text: "Mentions Count" } },
+            x: { title: { display: true, text: "Date" } }
+          }
+        }
+      });
+    }
+
+    function downloadPDF() {
+      const { jsPDF } = window.jspdf;
+      html2canvas(document.querySelector("#stats-tab")).then(canvas => {
+        const doc = new jsPDF();
+        const img = canvas.toDataURL("image/png");
+        doc.addImage(img, "PNG", 0, 0, doc.internal.pageSize.getWidth(), doc.internal.pageSize.getHeight());
+        doc.save("brand-stats.pdf");
+      });
+    }
+
+    switchBrand(currentBrand);
+    setInterval(loadData, 30000);
+  </script>
 </body>
 </html>
 '''
@@ -1184,31 +2113,111 @@ def run_monitoring_thread():
 def main():
     global db_manager, reddit_monitor
     
-    print("🚀 Starting All-in-One Reddit Brand Monitor...")
-    
-    # Initialize database
-    db_manager = DatabaseManager(CONFIG['database_file'])
-    print(f"✅ Database initialized: {CONFIG['database_file']}")
-    
-    # Initialize Reddit monitor
-    reddit_monitor = RedditMonitor(CONFIG, db_manager)
-    print("✅ Reddit monitor initialized")
-    
-    # Start monitoring in background thread
-    monitoring_thread = threading.Thread(target=run_monitoring_thread, daemon=True)
-    monitoring_thread.start()
-    print("✅ Background monitoring started")
-    
-    # Start Flask web interface
-    print(f"🌐 Starting web interface on port {CONFIG['port']}")
-    print(f"📊 Dashboard: http://localhost:{CONFIG['port']}")
-    print(f"🔍 Health check: http://localhost:{CONFIG['port']}/health")
+    print("🚀 Starting All-in-One Reddit Brand Monitor v2.0 - WITH BACKFILL FEATURE...")
+    print(f"🔧 Python version: {os.sys.version}")
+    print(f"🔧 Working directory: {os.getcwd()}")
+    print(f"🔧 PORT environment variable: {os.getenv('PORT', 'Not set')}")
     
     try:
-        app.run(host='0.0.0.0', port=CONFIG['port'], debug=False)
+        # Start with just Flask to ensure basic functionality
+        print("🔄 Starting Flask server first...")
+        port = int(os.getenv('PORT', CONFIG['port']))  # CRITICAL: Use Railway's PORT
+        print(f"🌐 Web interface will start on port {port}")
+        
+        # Initialize minimal components
+        print("🔄 Initializing database...")
+        
+        # Ensure data directory exists for persistent storage
+        data_dir = os.path.dirname(CONFIG['database_file'])
+        
+        # Create data directory with multiple fallback strategies
+        if not os.path.exists(data_dir):
+            try:
+                os.makedirs(data_dir, mode=0o755, exist_ok=True)
+                print(f"📁 Created data directory: {data_dir}")
+            except Exception as e:
+                print(f"⚠️ Could not create data directory {data_dir}: {e}")
+                # Fallback to current directory
+                CONFIG['database_file'] = 'reddit_monitor.db'
+                print(f"🔄 Falling back to current directory: {CONFIG['database_file']}")
+        
+        # Debug: Check volume mounting and permissions
+        print(f"🔍 Data directory: {data_dir}")
+        print(f"🔍 Data directory exists: {os.path.exists(data_dir)}")
+        if os.path.exists(data_dir):
+            print(f"🔍 Data directory permissions: {oct(os.stat(data_dir).st_mode)[-3:]}")
+            print(f"🔍 Data directory writable: {os.access(data_dir, os.W_OK)}")
+        
+        print(f"🔍 Database file path: {CONFIG['database_file']}")
+        print(f"🔍 Database file exists: {os.path.exists(CONFIG['database_file'])}")
+        if os.path.exists(CONFIG['database_file']):
+            print(f"🔍 Database file size: {os.path.getsize(CONFIG['database_file'])} bytes")
+            # Count existing mentions to verify persistence
+            try:
+                import sqlite3
+                conn = sqlite3.connect(CONFIG['database_file'])
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM mentions")
+                count = cursor.fetchone()[0]
+                conn.close()
+                print(f"🔍 Existing mentions in database: {count}")
+            except Exception as e:
+                print(f"🔍 Could not count existing mentions: {e}")
+        else:
+            print(f"🔍 Database file will be created at: {CONFIG['database_file']}")
+        
+        # Initialize database
+        db_manager = DatabaseManager(CONFIG['database_file'])
+        print(f"✅ Database initialized: {CONFIG['database_file']}")
+        
+        # Initialize Reddit monitor but don't start monitoring yet
+        print("🔄 Initializing Reddit monitor...")
+        reddit_monitor = RedditMonitor(CONFIG, db_manager)
+        print("✅ Reddit monitor initialized (monitoring will start after Flask)")
+        
+        # Start Flask first, then monitoring
+        print("✅ Starting Flask server...")
+        
+        # Start monitoring in background after a delay
+        def delayed_monitoring_start():
+            import time
+            time.sleep(10)  # Wait 10 seconds for Flask to fully start
+            try:
+                print("🔄 Starting background monitoring...")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(reddit_monitor.start_monitoring())
+            except Exception as e:
+                print(f"⚠️ Background monitoring failed to start: {e}")
+        
+        monitoring_thread = threading.Thread(target=delayed_monitoring_start, daemon=True)
+        monitoring_thread.start()
+        
+        # Start Flask - this should work since our test worked
+        print(f"🔍 Health check: http://localhost:{port}/health")
+        
+        # Log all registered routes for debugging
+        print("📋 Registered Flask routes:")
+        for rule in app.url_map.iter_rules():
+            print(f"   {rule.rule} -> {rule.endpoint}")
+        
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+        
+    except Exception as e:
+        print(f"❌ Critical error during startup: {e}")
+        import traceback
+        traceback.print_exc()
+        # Try to start Flask anyway with minimal functionality
+        try:
+            print(f"🚨 Attempting emergency Flask start on port {port}...")
+            app.run(host='0.0.0.0', port=port, debug=False)
+        except:
+            print("💥 Emergency Flask start also failed")
+            raise
     except KeyboardInterrupt:
         print("\n⏹️  Shutting down...")
-        reddit_monitor.stop_monitoring()
+        if 'reddit_monitor' in globals():
+            reddit_monitor.stop_monitoring()
 
 if __name__ == "__main__":
     main()
