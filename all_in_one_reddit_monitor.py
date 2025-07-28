@@ -824,16 +824,12 @@ class RedditMonitor:
         if not self.json_mention_buffer:
             return
         
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
         try:
             for mention_dict in self.json_mention_buffer:
                 # Extract context and analyze sentiment
                 context_text = mention_dict.get('context', mention_dict.get('content', ''))
                 if context_text and len(context_text) > 10:
-                    sentiment = loop.run_until_complete(self.sentiment.analyze(context_text))
+                    sentiment = self.sentiment.analyze(context_text)
                     logger.debug(f"💭 Analyzed sentiment for '{mention_dict['brand']}': {sentiment}")
                 else:
                     sentiment = "neutral"
@@ -859,8 +855,6 @@ class RedditMonitor:
                 
         except Exception as e:
             logger.error(f"Error processing JSON buffer: {e}")
-        finally:
-            loop.close()
     
     def _process_praw_buffer_with_sentiment(self):
         """Process PRAW mention buffer with sentiment analysis (synchronous)"""
@@ -868,28 +862,20 @@ class RedditMonitor:
             return
         
         # Add sentiment analysis for each mention
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        for mention in self.mention_buffer:
+            if mention.sentiment is None:
+                # Extract context around the brand mention for focused sentiment analysis
+                context_text = self._extract_brand_context(mention)
+                if context_text:
+                    # Run sentiment analysis on brand-focused context
+                    mention.sentiment = self.sentiment.analyze(context_text)
+                    logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
+                else:
+                    mention.sentiment = "neutral"  # Fallback if no context found
         
-        try:
-            for mention in self.mention_buffer:
-                if mention.sentiment is None:
-                    # Extract context around the brand mention for focused sentiment analysis
-                    context_text = self._extract_brand_context(mention)
-                    if context_text:
-                        # Run sentiment analysis on brand-focused context
-                        mention.sentiment = loop.run_until_complete(self.sentiment.analyze(context_text))
-                        logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
-                    else:
-                        mention.sentiment = "neutral"  # Fallback if no context found
-            
-            # Save to database
-            self.db.insert_mentions(self.mention_buffer)
-            logger.info(f"💭 Processed {len(self.mention_buffer)} brand mentions with sentiment analysis")
-        
-        finally:
-            loop.close()
+        # Save to database
+        self.db.insert_mentions(self.mention_buffer)
+        logger.info(f"💭 Processed {len(self.mention_buffer)} brand mentions with sentiment analysis")
     
     def _extract_simple_context(self, text, brand_name):
         """Simple context extraction for JSON monitoring"""
