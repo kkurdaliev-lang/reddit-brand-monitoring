@@ -44,7 +44,7 @@ CONFIG = {
         'client_secret': os.getenv('REDDIT_CLIENT_SECRET', ''),
         'user_agent': 'AllInOneBrandMonitor/1.0'
     },
-    'hf_api_token': os.getenv('HF_API_TOKEN', ''),
+    'groq_api_token': os.getenv('GROQ_API_TOKEN', ''),
     'brands': {
         'badinka': r'[@#]?badinka(?:\.com)?',
         'devilwalking': r'[@#]?devil\s*walking(?:\.com)?',  # Matches both "devilwalking" and "devil walking"
@@ -186,16 +186,19 @@ class DatabaseManager:
 class SentimentAnalyzer:
     def __init__(self, api_token: str):
         self.api_token = api_token
-        self.api_url = "https://api-inference.huggingface.co/models/tabularisai/multilingual-sentiment-analysis"
-        logger.info(f"🤖 Sentiment analyzer initialized with URL: {self.api_url}")
-        self.headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
+        self.api_url = "https://api.groq.com/openai/v1/chat/completions"
+        logger.info(f"🤖 Groq sentiment analyzer initialized with URL: {self.api_url}")
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_token}"
+        } if api_token else {}
     
-    def analyze(self, context_text: str) -> str:
-        """Analyze sentiment of brand-focused context text"""
-        logger.info(f"🔍 Starting sentiment analysis for text: '{context_text[:100]}...'")
+    def analyze(self, context_text: str, brand_name: str = "the brand") -> str:
+        """Analyze sentiment specifically toward a brand using Groq"""
+        logger.info(f"🔍 Starting Groq brand sentiment analysis for '{brand_name}' in text: '{context_text[:100]}...'")
         
         if not self.api_token:
-            logger.warning("❌ No HuggingFace API token provided")
+            logger.warning("❌ No Groq API token provided")
             return "neutral"
             
         if not context_text.strip():
@@ -203,44 +206,57 @@ class SentimentAnalyzer:
             return "neutral"
         
         try:
-            # Limit text length for API efficiency (focus on most relevant part)
-            focused_text = context_text[:400]  # Slightly shorter for better focus
-            payload = {"inputs": focused_text}
+            # Create brand-focused prompt
+            prompt = f"""Analyze the sentiment specifically about the brand '{brand_name}' in this text:
+
+"{context_text[:500]}"
+
+Focus ONLY on opinions, experiences, or feelings about this specific brand. Ignore general complaints or negative words that don't relate to the brand itself.
+
+For example:
+- "I ordered from {brand_name} and had zero issues, great quality" = positive (customer satisfied with brand)
+- "Shipping took forever but {brand_name} quality is amazing" = positive (complaint about shipping, not brand)
+- "{brand_name} clothes are overpriced and poor quality" = negative (directly about brand)
+
+Respond with ONLY ONE WORD: positive, negative, or neutral"""
+
+            payload = {
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": 10,
+                "temperature": 0.1
+            }
             
-            logger.info(f"📡 Sending request to: {self.api_url}")
-            logger.info(f"📦 Payload: {payload}")
-            logger.info(f"🔑 Headers: {self.headers}")
+            logger.info(f"📡 Sending request to Groq API")
+            logger.info(f"🎯 Brand focus: {brand_name}")
             
-            response = requests.post(self.api_url, headers=self.headers, json=payload, timeout=10)
+            response = requests.post(self.api_url, headers=self.headers, json=payload, timeout=15)
             logger.info(f"📊 Response status: {response.status_code}")
-            logger.info(f"📄 Response body: {response.text}")
             
             if response.status_code == 200:
                 result = response.json()
-                logger.info(f"✅ Parsed JSON result: {result}")
+                sentiment_text = result['choices'][0]['message']['content'].strip().lower()
+                logger.info(f"🤖 Groq response: '{sentiment_text}'")
                 
-                if result and isinstance(result, list) and result[0]:
-                    scores = result[0]
-                    best_score = max(scores, key=lambda x: x['score'])
-                    label = best_score['label'].lower()
-                    confidence = best_score['score']
-                    
-                    logger.info(f"🏆 Best score: {best_score}")
-                    
-                    # Map labels to our sentiment system
-                    if 'positive' in label:
-                        sentiment = 'positive'
-                    elif 'negative' in label:
-                        sentiment = 'negative'
-                    else:
-                        sentiment = 'neutral'
-                    
-                    logger.info(f"🎯 Final sentiment: {sentiment} (confidence: {confidence:.2f})")
-                    return sentiment
+                # Clean and validate response
+                if 'positive' in sentiment_text:
+                    sentiment = 'positive'
+                elif 'negative' in sentiment_text:
+                    sentiment = 'negative'
+                else:
+                    sentiment = 'neutral'
+                
+                logger.info(f"🎯 Final brand sentiment for '{brand_name}': {sentiment}")
+                return sentiment
             else:
-                logger.error(f"❌ HuggingFace API returned status {response.status_code}: {response.text}")
+                logger.error(f"❌ Groq API returned status {response.status_code}: {response.text}")
         except Exception as e:
-            logger.error(f"💥 Sentiment analysis error: {e}")
+            logger.error(f"💥 Groq sentiment analysis error: {e}")
             import traceback
             logger.error(f"📚 Traceback: {traceback.format_exc()}")
         
@@ -255,7 +271,7 @@ class RedditMonitor:
             name: re.compile(pattern, re.IGNORECASE)
             for name, pattern in config['brands'].items()
         }
-        self.sentiment = SentimentAnalyzer(config['hf_api_token'])
+        self.sentiment = SentimentAnalyzer(config['groq_api_token'])
         self.seen_ids = self.db.get_existing_ids()
         self.seen_core_ids = self.db.get_core_reddit_ids()  # For handling mixed ID formats
         self.seen_content = self.db.get_existing_content_hashes()
@@ -332,7 +348,7 @@ class RedditMonitor:
                 # Extract context around the brand mention for focused sentiment analysis
                 context_text = self._extract_brand_context(mention)
                 if context_text:
-                    mention.sentiment = self.sentiment.analyze(context_text)
+                    mention.sentiment = self.sentiment.analyze(context_text, mention.brand)
                     logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
                 else:
                     mention.sentiment = "neutral"  # Fallback if no context found
@@ -631,17 +647,12 @@ class RedditMonitor:
                         for brand in brands:
                             # Analyze sentiment IMMEDIATELY
                             context_text = comment.body[:400]  # Focus on relevant content
-                            import asyncio
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
                             try:
-                                sentiment = loop.run_until_complete(self.sentiment.analyze(context_text))
+                                sentiment = self.sentiment.analyze(context_text, brand)
                                 logger.info(f"💭 Analyzed sentiment for '{brand}': {sentiment}")
                             except Exception as e:
                                 sentiment = "neutral"
                                 logger.warning(f"Sentiment analysis failed for {brand}: {e}")
-                            finally:
-                                loop.close()
                             
                             mention = Mention(
                                 id=comment.id,  # Use actual Reddit comment ID (e.g., n3z93h6)
@@ -748,17 +759,12 @@ class RedditMonitor:
                         for brand in brands:
                             # Analyze sentiment IMMEDIATELY
                             context_text = full_text[:400]  # Focus on relevant content
-                            import asyncio
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
                             try:
-                                sentiment = loop.run_until_complete(self.sentiment.analyze(context_text))
+                                sentiment = self.sentiment.analyze(context_text, brand)
                                 logger.info(f"💭 Analyzed post sentiment for '{brand}': {sentiment}")
                             except Exception as e:
                                 sentiment = "neutral"
                                 logger.warning(f"Post sentiment analysis failed for {brand}: {e}")
-                            finally:
-                                loop.close()
                             
                             mention = Mention(
                                 id=post.id,  # Use actual Reddit post ID
@@ -829,7 +835,7 @@ class RedditMonitor:
                 # Extract context and analyze sentiment
                 context_text = mention_dict.get('context', mention_dict.get('content', ''))
                 if context_text and len(context_text) > 10:
-                    sentiment = self.sentiment.analyze(context_text)
+                    sentiment = self.sentiment.analyze(context_text, mention_dict['brand'])
                     logger.debug(f"💭 Analyzed sentiment for '{mention_dict['brand']}': {sentiment}")
                 else:
                     sentiment = "neutral"
@@ -868,7 +874,7 @@ class RedditMonitor:
                 context_text = self._extract_brand_context(mention)
                 if context_text:
                     # Run sentiment analysis on brand-focused context
-                    mention.sentiment = self.sentiment.analyze(context_text)
+                    mention.sentiment = self.sentiment.analyze(context_text, mention.brand)
                     logger.debug(f"💭 Analyzed sentiment for '{mention.brand}': {mention.sentiment}")
                 else:
                     mention.sentiment = "neutral"  # Fallback if no context found
@@ -1134,17 +1140,12 @@ class RedditMonitor:
                                 if brand_pattern.search(body):
                                     # Analyze sentiment IMMEDIATELY
                                     context = self._extract_simple_context(body, brand_name)
-                                    import asyncio
-                                    loop = asyncio.new_event_loop()
-                                    asyncio.set_event_loop(loop)
                                     try:
-                                        sentiment = loop.run_until_complete(self.sentiment.analyze(context))
+                                        sentiment = self.sentiment.analyze(context, brand_name)
                                         logger.info(f"💭 Analyzed JSON sentiment for '{brand_name}': {sentiment}")
                                     except Exception as e:
                                         sentiment = "neutral"
                                         logger.warning(f"JSON sentiment analysis failed for {brand_name}: {e}")
-                                    finally:
-                                        loop.close()
                                     
                                     # Use actual Reddit comment ID (e.g., n3z93h6)
                                     reddit_id = c.get('id')
