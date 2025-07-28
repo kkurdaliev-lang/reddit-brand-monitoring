@@ -10,7 +10,7 @@ All-in-One Reddit Brand Monitor
 """
 
 import asyncio
-import aiohttp
+# import aiohttp  # Commented out due to Python 3.13 compatibility issues
 import sqlite3
 import sys
 import praw
@@ -1563,30 +1563,44 @@ def favicon():
 
 @app.route('/download')
 def download_csv():
-    """Download all mentions as CSV"""
+    """Download mentions for current brand as CSV with specific format"""
     brand = request.args.get('brand')
     
     with db_manager.get_connection() as conn:
         if brand:
-            query = "SELECT * FROM mentions WHERE brand = ? ORDER BY created DESC"
+            query = "SELECT type, subreddit, author, permalink, created, title, body, sentiment FROM mentions WHERE brand = ? ORDER BY created DESC"
             cursor = conn.execute(query, (brand,))
         else:
-            query = "SELECT * FROM mentions ORDER BY created DESC"
+            query = "SELECT type, subreddit, author, permalink, created, title, body, sentiment FROM mentions ORDER BY created DESC"
             cursor = conn.execute(query)
         
         mentions = cursor.fetchall()
     
     # Create CSV output
     output = io.StringIO()
-    writer = csv.writer(output)
+    writer = csv.writer(output, delimiter='\t')  # Using tab delimiter as requested
     
-    # Write header
-    writer.writerow(['ID', 'Type', 'Brand', 'Subreddit', 'Author', 'Title', 'Body', 
-                     'Permalink', 'Created', 'Score', 'Sentiment', 'Source'])
+    # Write header with requested format
+    writer.writerow(['Type', 'Subreddit', 'Author', 'Link', 'Created', 'Preview', 'Sentiment'])
     
     # Write data
     for mention in mentions:
-        writer.writerow(mention)
+        type_val, subreddit, author, permalink, created, title, body, sentiment = mention
+        # Create preview from title or body
+        preview = title if title else (body if body else "")
+        # Truncate preview if too long
+        if len(preview) > 200:
+            preview = preview[:200] + "..."
+        
+        writer.writerow([
+            type_val,
+            subreddit,
+            author,
+            f"https://reddit.com{permalink}" if permalink and not permalink.startswith('http') else permalink,
+            created,
+            preview,
+            sentiment or "neutral"
+        ])
     
     # Create response
     csv_output = output.getvalue()
@@ -1714,10 +1728,10 @@ HTML_TEMPLATE = '''
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <style>
-    body { font-family: sans-serif; margin: 20px; background-color: #f9f9f9; color: #333; }
+    body { font-family: sans-serif; margin: 20px; background-color: #f9f9f9; color: #333; max-width: 100%; overflow-x: hidden; }
     h1, h2, h3 { color: #222; }
-    table { width: 100%; border-collapse: collapse; margin-top: 20px; background-color: #fff; }
-    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; background-color: #fff; table-layout: fixed; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; word-wrap: break-word; overflow: hidden; }
     th { background-color: #f0f0f0; }
     button { padding: 6px 12px; font-size: 14px; cursor: pointer; border-radius: 4px; border: none; background-color: #007bff; color: white; }
     button:disabled { background-color: #aaa; cursor: not-allowed; }
@@ -1735,17 +1749,25 @@ HTML_TEMPLATE = '''
     .charts-table { width: 100%; table-layout: fixed; margin-top: 20px; }
     .charts-table td { text-align: center; vertical-align: top; }
     .charts-table canvas { width: 300px; height: 300px; }
+    #data-table th:nth-child(1) { width: 8%; } /* Type */
+    #data-table th:nth-child(2) { width: 12%; } /* Subreddit */
+    #data-table th:nth-child(3) { width: 12%; } /* Author */
+    #data-table th:nth-child(4) { width: 8%; } /* Link */
+    #data-table th:nth-child(5) { width: 15%; } /* Created */
+    #data-table th:nth-child(6) { width: 30%; } /* Preview */
+    #data-table th:nth-child(7) { width: 10%; } /* Sentiment */
+    #data-table th:nth-child(8) { width: 5%; } /* Action */
   </style>
 </head>
 <body>
-  <h1>Reddit Brand Monitoring - ALL OF REDDIT 🌍</h1>
+  <h1>Reddit Brand Monitoring</h1>
      <div id="brand-buttons">
      <button id="btn-badinka" onclick="switchBrand('badinka')">Badinka</button>
      <button id="btn-devilwalking" onclick="switchBrand('devilwalking')">Devil Walking</button>
      <button id="btn-stats" onclick="showStats()">Stats</button>
    </div>
   <p class="csv-btn">
-    <button id="csv-btn" onclick="window.location.href='/download'">📥 Download CSV</button>
+    <button id="csv-btn" onclick="downloadCurrentBrandCSV()">📥 Download CSV</button>
     <button id="pdf-btn" style="display:none;" onclick="downloadPDF()">📄 Download as PDF</button>
   </p>
 
@@ -1881,6 +1903,10 @@ HTML_TEMPLATE = '''
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id })
       }).then(() => loadData());
+    }
+
+    function downloadCurrentBrandCSV() {
+      window.location.href = `/download?brand=${currentBrand}`;
     }
 
          function loadStats() {
