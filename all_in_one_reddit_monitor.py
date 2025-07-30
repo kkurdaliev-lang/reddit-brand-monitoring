@@ -57,10 +57,13 @@ CONFIG = {
         "Lollapalooza", "EDM", "BeyondWonderland", "kandi"
     ],
     'subreddits': [
-        "Rezz", "aves", "ElectricForest", "sewing", "avesfashion",
-        "cyber_fashion", "aveoutfits", "RitaFourEssenceSystem", "SoftDramatics", "Shein",
-        "avesNYC", "veld", "BADINKA", "PlusSize",
-        "LostLandsMusicFest", "festivals", "avefashion", "avesafe", "EDCOrlando"
+        # Fallback subreddits
+        "Rezz", "aves", "ElectricForest", "avesfashion",
+        "cyber_fashion", "aveoutfits", "RitaFourEssenceSystem",
+        "avesNYC", "veld", "BADINKA","LostLandsMusicFest", "festivals", 
+	    "avefashion", "avesafe", "EDCOrlando",
+        "BassCanyon", "Tomorrowland", "Soundhaven", "Shambhala",
+        "Lollapalooza", "EDM", "BeyondWonderland"
     ],
     'port': int(os.getenv('PORT', 5000))
 }
@@ -2208,67 +2211,7 @@ def system_health_status():
     except Exception as e:
         return jsonify({"error": f"Health check failed: {str(e)}"}), 500
 
-@app.route('/re-evaluate-sentiment', methods=['POST'])
-def re_evaluate_sentiment():
-    """Re-evaluate sentiment for all existing mentions using the new Groq model"""
-    try:
-        if not reddit_monitor or not reddit_monitor.sentiment:
-            return jsonify({"error": "Sentiment analyzer not available"}), 500
-        
-        logger.info("🔄 Starting sentiment re-evaluation for all mentions...")
-        
-        # Get all mentions from database
-        with db_manager.get_connection() as conn:
-            cursor = conn.execute("SELECT id, title, body, brand FROM mentions ORDER BY created DESC")
-            mentions = cursor.fetchall()
-        
-        if not mentions:
-            return jsonify({"message": "No mentions found to re-evaluate", "updated": 0})
-        
-        updated_count = 0
-        batch_size = 10
-        
-        logger.info(f"📊 Found {len(mentions)} mentions to re-evaluate")
-        
-        # Process in batches to avoid overwhelming the API
-        for i in range(0, len(mentions), batch_size):
-            batch = mentions[i:i + batch_size]
-            logger.info(f"🔄 Processing batch {i//batch_size + 1}/{(len(mentions) + batch_size - 1)//batch_size}")
-            
-            for mention_id, title, body, brand in batch:
-                try:
-                    # Extract context for sentiment analysis
-                    context_text = f"{title or ''} {body or ''}".strip()
-                    if context_text and len(context_text) > 10:
-                        # Analyze sentiment with new Groq model
-                        new_sentiment = reddit_monitor.sentiment.analyze(context_text[:400], brand)
-                        
-                        # Update database
-                        with db_manager.get_connection() as conn:
-                            conn.execute("UPDATE mentions SET sentiment = ? WHERE id = ?", (new_sentiment, mention_id))
-                            conn.commit()
-                        
-                        updated_count += 1
-                        logger.debug(f"✅ Updated sentiment for {mention_id}: {new_sentiment}")
-                    
-                except Exception as e:
-                    logger.error(f"❌ Error re-evaluating sentiment for {mention_id}: {e}")
-                    continue
-            
-            # Small delay between batches to be respectful to the API
-            time.sleep(2)
-        
-        logger.info(f"✅ Sentiment re-evaluation completed: {updated_count} mentions updated")
-        
-        return jsonify({
-            "message": f"Successfully re-evaluated sentiment for {updated_count} mentions",
-            "total_processed": len(mentions),
-            "updated": updated_count
-        })
-        
-    except Exception as e:
-        logger.error(f"❌ Error during sentiment re-evaluation: {e}")
-        return jsonify({"error": f"Re-evaluation failed: {str(e)}"}), 500
+
 
 # HTML Template (embedded) - User's Preferred Version
 HTML_TEMPLATE = '''
@@ -2322,7 +2265,6 @@ HTML_TEMPLATE = '''
   <p class="csv-btn">
     <button id="csv-btn" onclick="downloadCurrentBrandCSV()">📥 Download CSV</button>
     <button id="pdf-btn" style="display:none;" onclick="downloadPDF()">📄 Download as PDF</button>
-    <button id="re-evaluate-btn" onclick="reEvaluateSentiment()">🔄 Re-evaluate All Sentiment</button>
   </p>
 
   <div id="mentions-tab">
@@ -2461,40 +2403,6 @@ HTML_TEMPLATE = '''
 
     function downloadCurrentBrandCSV() {
       window.location.href = `/download?brand=${currentBrand}`;
-    }
-
-    function reEvaluateSentiment() {
-      if (!confirm("This will re-analyze sentiment for ALL existing entries using the new Groq model. This may take several minutes. Continue?")) {
-        return;
-      }
-      
-      const button = document.getElementById('re-evaluate-btn');
-      const originalText = button.textContent;
-      button.disabled = true;
-      button.textContent = '🔄 Processing...';
-      
-      fetch('/re-evaluate-sentiment', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      })
-      .then(response => response.json())
-      .then(data => {
-        if (data.error) {
-          alert(`Error: ${data.error}`);
-        } else {
-          alert(`Success! ${data.message}`);
-          loadData(); // Refresh the current view
-        }
-      })
-      .catch(error => {
-        alert(`Error: ${error.message}`);
-      })
-      .finally(() => {
-        button.disabled = false;
-        button.textContent = originalText;
-      });
     }
 
          function loadStats() {
