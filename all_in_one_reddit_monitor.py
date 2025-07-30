@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-All-in-One Reddit Brand Monitor
-- Single file deployment
-- Embedded SQLite database
-- Built-in web interface
-- Real-time monitoring
-- Perfect for commercial deployment
-- Now monitoring ALL of Reddit!
-"""
-
 import asyncio
 # import aiohttp  # Commented out due to Python 3.13 compatibility issues
 import sqlite3
@@ -31,6 +20,10 @@ from contextlib import contextmanager
 import tempfile
 import csv
 import io
+import random
+from collections import deque, defaultdict
+import random
+from collections import deque, defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -183,6 +176,214 @@ class DatabaseManager:
                 hashes.add(content_hash)
             return hashes
 
+class ErrorTracker:
+    """Track API errors and implement smart backoff strategies"""
+    def __init__(self):
+        self.error_counts = defaultdict(int)
+        self.last_error_time = defaultdict(float)
+        self.circuit_breaker_until = defaultdict(float)
+        self.backoff_delays = defaultdict(float)
+    
+    def record_error(self, source: str, error_type: str = "500"):
+        """Record an error for exponential backoff calculation"""
+        current_time = time.time()
+        self.error_counts[source] += 1
+        self.last_error_time[source] = current_time
+        
+        # Exponential backoff: 2^errors * base_delay (max 300 seconds)
+        base_delay = 30
+        self.backoff_delays[source] = min(300, base_delay * (2 ** min(self.error_counts[source] - 1, 4)))
+        
+        # Circuit breaker: if too many errors in short time, break circuit
+        if self.error_counts[source] >= 5:
+            self.circuit_breaker_until[source] = current_time + 600  # 10 minutes
+            logger.warning(f"🚨 Circuit breaker activated for {source} - cooling down for 10 minutes")
+        
+        logger.warning(f"📊 Error recorded for {source}: count={self.error_counts[source]}, backoff={self.backoff_delays[source]}s")
+    
+    def record_success(self, source: str):
+        """Record a successful request to reset error tracking"""
+        if source in self.error_counts and self.error_counts[source] > 0:
+            logger.info(f"✅ Success recorded for {source} - resetting error count from {self.error_counts[source]} to 0")
+            self.error_counts[source] = 0
+            self.backoff_delays[source] = 0
+    
+    def should_skip_request(self, source: str) -> tuple[bool, float]:
+        """Check if we should skip a request due to errors"""
+        current_time = time.time()
+        
+        # Check circuit breaker
+        if current_time < self.circuit_breaker_until.get(source, 0):
+            remaining = self.circuit_breaker_until[source] - current_time
+            return True, remaining
+        
+        # Check backoff delay
+        if current_time < (self.last_error_time.get(source, 0) + self.backoff_delays.get(source, 0)):
+            remaining = (self.last_error_time[source] + self.backoff_delays[source]) - current_time
+            return True, remaining
+        
+        return False, 0
+    
+    def get_delay_with_jitter(self, source: str) -> float:
+        """Get delay with jitter to avoid thundering herd"""
+        base_delay = self.backoff_delays.get(source, 0)
+        if base_delay == 0:
+            return 0
+        # Add 20% jitter
+        jitter = base_delay * 0.2 * random.random()
+        return base_delay + jitter
+
+class FailedRequestQueue:
+    """Queue and retry failed requests"""
+    def __init__(self, max_size: int = 1000):
+        self.queue = deque(maxlen=max_size)
+        self.processing = False
+    
+    def add_failed_request(self, request_info: dict):
+        """Add a failed request to retry queue"""
+        request_info['retry_count'] = request_info.get('retry_count', 0) + 1
+        request_info['queued_at'] = time.time()
+        
+        # Only retry up to 3 times
+        if request_info['retry_count'] <= 3:
+            self.queue.append(request_info)
+            logger.info(f"📝 Queued failed request: {request_info['type']} (attempt {request_info['retry_count']})")
+        else:
+            logger.warning(f"❌ Dropping request after 3 failed attempts: {request_info['type']}")
+    
+    def get_next_request(self) -> Optional[dict]:
+        """Get next request to retry"""
+        if not self.queue:
+            return None
+        
+        # Get oldest request
+        request = self.queue.popleft()
+        
+        # Check if request is too old (older than 1 hour)
+        if time.time() - request['queued_at'] > 3600:
+            logger.warning(f"⏰ Dropping stale request: {request['type']}")
+            return self.get_next_request()  # Try next request
+        
+        return request
+    
+    def size(self) -> int:
+        return len(self.queue)
+
+class RSSBackupMonitor:
+    """RSS-based backup monitoring that activates during API failures"""
+    def __init__(self, brands: dict, db: DatabaseManager, sentiment: 'SentimentAnalyzer'):
+        self.brands = brands
+        self.db = db
+        self.sentiment = sentiment
+        self.running = False
+        self.seen_rss_ids = set()
+        self.active = False  # Only active when primary systems fail
+    
+    def activate(self):
+        """Activate RSS backup monitoring"""
+        if not self.active:
+            self.active = True
+            logger.info("🔄 RSS backup monitoring ACTIVATED")
+    
+    def deactivate(self):
+        """Deactivate RSS backup monitoring"""
+        if self.active:
+            self.active = False
+            logger.info("✅ RSS backup monitoring DEACTIVATED - primary systems recovered")
+    
+    def monitor_rss_feeds(self):
+        """Monitor RSS feeds as backup"""
+        logger.info("📡 RSS backup monitor started")
+        
+        while self.running:
+            try:
+                if not self.active:
+                    time.sleep(30)  # Check every 30 seconds if we should activate
+                    continue
+                
+                # Monitor key RSS endpoints
+                rss_urls = [
+                    "https://www.reddit.com/r/all/new/.rss?limit=100",
+                    "https://www.reddit.com/r/all/comments/.rss?limit=100"
+                ]
+                
+                for url in rss_urls:
+                    if not self.running or not self.active:
+                        break
+                    
+                    try:
+                        response = requests.get(url, timeout=15)
+                        if response.status_code == 200:
+                            self._process_rss_content(response.text, url)
+                            logger.debug(f"✅ RSS backup processed: {url}")
+                        else:
+                            logger.warning(f"❌ RSS backup failed: {url} - status {response.status_code}")
+                    except Exception as e:
+                        logger.error(f"❌ RSS backup error for {url}: {e}")
+                    
+                    time.sleep(10)  # Delay between RSS feeds
+                
+                time.sleep(60)  # Check RSS every minute when active
+                
+            except Exception as e:
+                logger.error(f"❌ RSS backup monitoring error: {e}")
+                time.sleep(60)
+    
+    def _process_rss_content(self, rss_text: str, source_url: str):
+        """Process RSS content for brand mentions"""
+        try:
+            feed = feedparser.parse(rss_text)
+            mentions_found = 0
+            
+            for entry in feed.entries:
+                if not self.running or not self.active:
+                    break
+                
+                # Extract ID from entry
+                entry_id = entry.get('id', entry.get('link', ''))
+                if entry_id in self.seen_rss_ids:
+                    continue
+                
+                # Check for brand mentions
+                title = entry.get('title', '')
+                summary = entry.get('summary', '')
+                full_text = f"{title} {summary}"
+                
+                for brand_name, brand_pattern in self.brands.items():
+                    if brand_pattern.search(full_text):
+                        # Found a brand mention via RSS backup!
+                        try:
+                            sentiment = self.sentiment.analyze(full_text[:400], brand_name)
+                        except:
+                            sentiment = "neutral"
+                        
+                        mention = Mention(
+                            id=f"rss_backup_{hash(entry_id)}_{brand_name}",
+                            type="rss_backup",
+                            title=title,
+                            body=summary,
+                            permalink=entry.get('link', ''),
+                            created=datetime.now(timezone.utc).isoformat(),
+                            subreddit="unknown",
+                            author=entry.get('author', 'unknown'),
+                            score=0,
+                            sentiment=sentiment,
+                            brand=brand_name,
+                            source="rss_backup"
+                        )
+                        
+                        self.db.insert_mentions([mention])
+                        mentions_found += 1
+                        logger.info(f"🔄 RSS backup found: {brand_name} mention via {source_url}")
+                
+                self.seen_rss_ids.add(entry_id)
+            
+            if mentions_found > 0:
+                logger.info(f"✅ RSS backup processed {mentions_found} mentions from {source_url}")
+                
+        except Exception as e:
+            logger.error(f"❌ RSS content processing error: {e}")
+
 class SentimentAnalyzer:
     def __init__(self, api_token: str):
         self.api_token = api_token
@@ -291,6 +492,18 @@ class RedditMonitor:
         self.last_post_rate_limit = None
         self.comment_rate_limit_start = None
         self.post_rate_limit_start = None
+        
+        # 🛡️ NEW RESILIENCE SYSTEMS
+        self.error_tracker = ErrorTracker()
+        self.failed_request_queue = FailedRequestQueue()
+        self.rss_backup = RSSBackupMonitor(self.brands, self.db, self.sentiment)
+        self.system_health = {
+            'praw_comments': True,
+            'praw_posts': True, 
+            'json_api': True,
+            'rss_backup': False
+        }
+        logger.info("🛡️ Resilience systems initialized: error tracking, request queue, RSS backup")
         
         # Initialize Reddit client
         if config['reddit']['client_id'] and config['reddit']['client_secret']:
@@ -577,7 +790,23 @@ class RedditMonitor:
         if not self.reddit:
             return
         
-        logger.info("Starting PRAW monitoring with staggered timing...")
+        logger.info("🚀 Starting PRAW monitoring with staggered timing and resilience systems...")
+        
+        # 🛡️ Start RSS backup monitor (always running, activates when needed)
+        self.rss_backup.running = True
+        rss_thread = threading.Thread(target=self.rss_backup.monitor_rss_feeds, daemon=True)
+        rss_thread.start()
+        logger.info("✅ Started RSS backup monitor (standby mode)")
+        
+        # 🛡️ Start failed request processor
+        retry_thread = threading.Thread(target=self._process_failed_requests, daemon=True)
+        retry_thread.start()
+        logger.info("✅ Started failed request processor")
+        
+        # 🛡️ Start system health monitor
+        health_thread = threading.Thread(target=self._monitor_system_health, daemon=True)
+        health_thread.start()
+        logger.info("✅ Started system health monitor")
         
         # Start comment monitoring immediately
         comment_thread = threading.Thread(target=self._monitor_praw_comments, daemon=True)
@@ -601,6 +830,9 @@ class RedditMonitor:
         comment_thread.join()
         post_thread.join()
         json_thread.join()
+        rss_thread.join()
+        retry_thread.join()
+        health_thread.join()
     
     def _monitor_praw_comments(self):
         """Monitor comments using PRAW"""
@@ -641,6 +873,10 @@ class RedditMonitor:
                     
                     if self._comment_count % 100 == 0:
                         logger.debug(f"🔍 Processed {self._comment_count} comments, checking: '{comment.body[:50]}...'")
+                        # 🛡️ Record successful processing every 100 comments
+                        self.error_tracker.record_success("praw_comments")
+                        self.system_health['praw_comments'] = True
+                        self._check_backup_deactivation()
                     
                     brands = self.find_brands(comment.body)
                     if brands:
@@ -698,7 +934,16 @@ class RedditMonitor:
                 # Track rate limit period for backfill
                 self.comment_rate_limit_start = datetime.now(timezone.utc)
                 logger.warning("PRAW rate limited, sleeping 60 seconds")
+                
+                # 🛡️ Activate RSS backup during rate limit
+                self.system_health['praw_comments'] = False
+                self._check_backup_activation()
+                
                 time.sleep(60)
+                
+                # Mark system as healthy after rate limit
+                self.system_health['praw_comments'] = True
+                self._check_backup_deactivation()
                 
                 # After rate limit ends, trigger backfill
                 rate_limit_end = datetime.now(timezone.utc)
@@ -709,8 +954,27 @@ class RedditMonitor:
                         args=("comments", self.comment_rate_limit_start, rate_limit_end),
                         daemon=True
                     ).start()
+            except prawcore.exceptions.ServerError as e:
+                # 🛡️ Handle 500 errors with smart backoff
+                logger.warning(f"PRAW server error (500): {e}")
+                self.error_tracker.record_error("praw_comments", "500")
+                self.system_health['praw_comments'] = False
+                self._check_backup_activation()
+                
+                # Add failed request to retry queue
+                self.failed_request_queue.add_failed_request({
+                    'type': 'praw_comments',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'error': str(e)
+                })
+                
+                # Smart backoff delay
+                delay = self.error_tracker.get_delay_with_jitter("praw_comments")
+                logger.warning(f"⏳ Backing off for {delay:.1f} seconds due to 500 errors")
+                time.sleep(delay)
             except Exception as e:
                 logger.error(f"PRAW comment monitoring error: {e}")
+                self.error_tracker.record_error("praw_comments", "other")
                 time.sleep(30)
     
     def _monitor_praw_posts(self):
@@ -750,6 +1014,10 @@ class RedditMonitor:
                     
                     if self._post_count % 50 == 0:
                         logger.debug(f"📝 Processed {self._post_count} posts, checking: '{post.title[:50]}...'")
+                        # 🛡️ Record successful processing every 50 posts
+                        self.error_tracker.record_success("praw_posts")
+                        self.system_health['praw_posts'] = True
+                        self._check_backup_deactivation()
                     
                     # Check both title and selftext for brand mentions
                     full_text = f"{post.title} {post.selftext}"
@@ -810,7 +1078,16 @@ class RedditMonitor:
                 # Track rate limit period for backfill
                 self.post_rate_limit_start = datetime.now(timezone.utc)
                 logger.warning("PRAW posts rate limited, sleeping 60 seconds")
+                
+                # 🛡️ Activate RSS backup during rate limit
+                self.system_health['praw_posts'] = False
+                self._check_backup_activation()
+                
                 time.sleep(60)
+                
+                # Mark system as healthy after rate limit
+                self.system_health['praw_posts'] = True
+                self._check_backup_deactivation()
                 
                 # After rate limit ends, trigger backfill
                 rate_limit_end = datetime.now(timezone.utc)
@@ -821,8 +1098,27 @@ class RedditMonitor:
                         args=("posts", self.post_rate_limit_start, rate_limit_end),
                         daemon=True
                     ).start()
+            except prawcore.exceptions.ServerError as e:
+                # 🛡️ Handle 500 errors with smart backoff
+                logger.warning(f"PRAW posts server error (500): {e}")
+                self.error_tracker.record_error("praw_posts", "500")
+                self.system_health['praw_posts'] = False
+                self._check_backup_activation()
+                
+                # Add failed request to retry queue
+                self.failed_request_queue.add_failed_request({
+                    'type': 'praw_posts',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'error': str(e)
+                })
+                
+                # Smart backoff delay
+                delay = self.error_tracker.get_delay_with_jitter("praw_posts")
+                logger.warning(f"⏳ Posts backing off for {delay:.1f} seconds due to 500 errors")
+                time.sleep(delay)
             except Exception as e:
                 logger.error(f"PRAW post monitoring error: {e}")
+                self.error_tracker.record_error("praw_posts", "other")
                 time.sleep(30)
     
     def _process_json_buffer_with_sentiment(self):
@@ -1266,9 +1562,181 @@ class RedditMonitor:
         except Exception as e:
             logger.error(f"Focused subreddit posts processing error: {e}")
 
+    def _check_backup_activation(self):
+        """Check if RSS backup should be activated"""
+        primary_systems_down = (
+            not self.system_health['praw_comments'] or 
+            not self.system_health['praw_posts'] or 
+            not self.system_health['json_api']
+        )
+        
+        if primary_systems_down and not self.rss_backup.active:
+            logger.warning("🚨 Primary systems failing - activating RSS backup!")
+            self.rss_backup.activate()
+            self.system_health['rss_backup'] = True
+    
+    def _check_backup_deactivation(self):
+        """Check if RSS backup can be deactivated"""
+        primary_systems_healthy = (
+            self.system_health['praw_comments'] and 
+            self.system_health['praw_posts'] and 
+            self.system_health['json_api']
+        )
+        
+        if primary_systems_healthy and self.rss_backup.active:
+            logger.info("✅ Primary systems recovered - deactivating RSS backup")
+            self.rss_backup.deactivate()
+            self.system_health['rss_backup'] = False
+
+    def _process_failed_requests(self):
+        """Continuously process and retry requests from the failed_request_queue"""
+        logger.info("🔄 Failed request processor started")
+        
+        while self.running:
+            try:
+                request = self.failed_request_queue.get_next_request()
+                if not request:
+                    time.sleep(30)  # No requests to retry, wait
+                    continue
+                
+                # Check if we should skip this request due to circuit breaker
+                should_skip, delay = self.error_tracker.should_skip_request(request['type'])
+                if should_skip:
+                    logger.info(f"⏳ Skipping retry for {request['type']} - circuit breaker active ({delay:.0f}s remaining)")
+                    time.sleep(min(delay, 60))  # Wait but not more than 1 minute
+                    continue
+                
+                # Attempt to retry the request
+                logger.info(f"🔄 Retrying failed request: {request['type']} (attempt {request['retry_count']})")
+                success = self._retry_failed_request(request)
+                
+                if success:
+                    self.error_tracker.record_success(request['type'])
+                    logger.info(f"✅ Successfully retried: {request['type']}")
+                else:
+                    self.error_tracker.record_error(request['type'], "retry_failed")
+                    logger.warning(f"❌ Retry failed for: {request['type']}")
+                
+                time.sleep(10)  # Small delay between retries
+                
+            except Exception as e:
+                logger.error(f"❌ Error in failed request processor: {e}")
+                time.sleep(60)
+    
+    def _retry_failed_request(self, request_info: dict) -> bool:
+        """Retry a specific failed request"""
+        try:
+            request_type = request_info['type']
+            
+            if request_type == 'praw_comments':
+                # Retry PRAW comment monitoring for a short burst
+                if self.reddit:
+                    subreddit = self.reddit.subreddit("all" if self.config.get('monitor_all_reddit') else "+".join(self.config['subreddits']))
+                    comment_stream = subreddit.stream.comments(skip_existing=True, pause_after=5)
+                    
+                    for i, comment in enumerate(comment_stream):
+                        if i >= 10 or comment is None:  # Process max 10 comments in retry
+                            break
+                        
+                        brands = self.find_brands(comment.body)
+                        if brands:
+                            for brand in brands:
+                                # Process the mention
+                                logger.info(f"🔄 Retry found: {brand} mention in PRAW comments")
+                            return True
+                    
+            elif request_type == 'praw_posts':
+                # Retry PRAW post monitoring for a short burst
+                if self.reddit:
+                    subreddit = self.reddit.subreddit("all" if self.config.get('monitor_all_reddit') else "+".join(self.config['subreddits']))
+                    post_stream = subreddit.stream.submissions(skip_existing=True, pause_after=5)
+                    
+                    for i, post in enumerate(post_stream):
+                        if i >= 5 or post is None:  # Process max 5 posts in retry
+                            break
+                        
+                        full_text = f"{post.title} {post.selftext}"
+                        brands = self.find_brands(full_text)
+                        if brands:
+                            for brand in brands:
+                                logger.info(f"🔄 Retry found: {brand} mention in PRAW posts")
+                            return True
+                            
+            elif request_type == 'json_api':
+                # Retry JSON API call
+                url = "https://www.reddit.com/r/all/comments.json?limit=25"
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    children = data.get("data", {}).get("children", [])
+                    for item in children[:5]:  # Process max 5 comments in retry
+                        comment_data = item.get("data", {})
+                        body = comment_data.get("body", "")
+                        brands = self.find_brands(body)
+                        if brands:
+                            logger.info(f"🔄 Retry found: brand mention in JSON API")
+                            return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrying {request_info['type']}: {e}")
+            return False
+    
+    def _monitor_system_health(self):
+        """Monitor overall system health and log status"""
+        logger.info("🏥 System health monitor started")
+        
+        while self.running:
+            try:
+                # Calculate overall health
+                healthy_systems = sum(self.system_health.values())
+                total_systems = len(self.system_health)
+                health_percentage = (healthy_systems / total_systems) * 100
+                
+                # Log system status every 5 minutes
+                logger.info(f"🏥 System Health: {health_percentage:.0f}% ({healthy_systems}/{total_systems} systems healthy)")
+                
+                # Log individual system status
+                for system, status in self.system_health.items():
+                    status_emoji = "✅" if status else "❌"
+                    logger.info(f"   {status_emoji} {system}: {'Healthy' if status else 'Unhealthy'}")
+                
+                # Log error statistics
+                total_errors = sum(self.error_tracker.error_counts.values())
+                if total_errors > 0:
+                    logger.info(f"📊 Total errors across all systems: {total_errors}")
+                    for source, count in self.error_tracker.error_counts.items():
+                        if count > 0:
+                            logger.info(f"   ❌ {source}: {count} errors")
+                
+                # Log queue status
+                queue_size = self.failed_request_queue.size()
+                if queue_size > 0:
+                    logger.info(f"📝 Failed request queue size: {queue_size}")
+                
+                # Log RSS backup status
+                if self.rss_backup.active:
+                    logger.info("🔄 RSS backup system: ACTIVE")
+                else:
+                    logger.info("💤 RSS backup system: STANDBY")
+                
+                # Emergency RSS activation if health is critically low
+                if health_percentage < 30 and not self.rss_backup.active:
+                    logger.warning("🚨 CRITICAL: System health below 30% - Emergency RSS backup activation!")
+                    self.rss_backup.activate()
+                    self.system_health['rss_backup'] = True
+                
+                time.sleep(300)  # Check every 5 minutes
+                
+            except Exception as e:
+                logger.error(f"❌ System health monitor error: {e}")
+                time.sleep(300)
+
     def stop_monitoring(self):
         """Stop monitoring"""
         self.running = False
+        self.rss_backup.running = False
         logger.info("Stopping Reddit monitoring...")
 
 # Flask Web Interface
@@ -1698,6 +2166,108 @@ def weekly_mentions():
     
     return jsonify(weekly_data)
 
+@app.route('/system-health')
+def system_health_status():
+    """Get detailed system health information"""
+    if not reddit_monitor:
+        return jsonify({"error": "Reddit monitor not initialized"}), 500
+    
+    try:
+        # Get system health
+        healthy_systems = sum(reddit_monitor.system_health.values())
+        total_systems = len(reddit_monitor.system_health)
+        health_percentage = (healthy_systems / total_systems) * 100
+        
+        # Get error statistics
+        error_stats = {}
+        for source, count in reddit_monitor.error_tracker.error_counts.items():
+            if count > 0:
+                error_stats[source] = {
+                    'error_count': count,
+                    'last_error': reddit_monitor.error_tracker.last_error_time.get(source, 0),
+                    'backoff_delay': reddit_monitor.error_tracker.backoff_delays.get(source, 0),
+                    'circuit_breaker_until': reddit_monitor.error_tracker.circuit_breaker_until.get(source, 0)
+                }
+        
+        # Get queue status
+        queue_size = reddit_monitor.failed_request_queue.size()
+        
+        return jsonify({
+            "overall_health": f"{health_percentage:.0f}%",
+            "healthy_systems": healthy_systems,
+            "total_systems": total_systems,
+            "system_status": reddit_monitor.system_health,
+            "error_statistics": error_stats,
+            "failed_request_queue_size": queue_size,
+            "rss_backup_active": reddit_monitor.rss_backup.active if reddit_monitor.rss_backup else False,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Health check failed: {str(e)}"}), 500
+
+@app.route('/re-evaluate-sentiment', methods=['POST'])
+def re_evaluate_sentiment():
+    """Re-evaluate sentiment for all existing mentions using the new Groq model"""
+    try:
+        if not reddit_monitor or not reddit_monitor.sentiment:
+            return jsonify({"error": "Sentiment analyzer not available"}), 500
+        
+        logger.info("🔄 Starting sentiment re-evaluation for all mentions...")
+        
+        # Get all mentions from database
+        with db_manager.get_connection() as conn:
+            cursor = conn.execute("SELECT id, title, body, brand FROM mentions ORDER BY created DESC")
+            mentions = cursor.fetchall()
+        
+        if not mentions:
+            return jsonify({"message": "No mentions found to re-evaluate", "updated": 0})
+        
+        updated_count = 0
+        batch_size = 10
+        
+        logger.info(f"📊 Found {len(mentions)} mentions to re-evaluate")
+        
+        # Process in batches to avoid overwhelming the API
+        for i in range(0, len(mentions), batch_size):
+            batch = mentions[i:i + batch_size]
+            logger.info(f"🔄 Processing batch {i//batch_size + 1}/{(len(mentions) + batch_size - 1)//batch_size}")
+            
+            for mention_id, title, body, brand in batch:
+                try:
+                    # Extract context for sentiment analysis
+                    context_text = f"{title or ''} {body or ''}".strip()
+                    if context_text and len(context_text) > 10:
+                        # Analyze sentiment with new Groq model
+                        new_sentiment = reddit_monitor.sentiment.analyze(context_text[:400], brand)
+                        
+                        # Update database
+                        with db_manager.get_connection() as conn:
+                            conn.execute("UPDATE mentions SET sentiment = ? WHERE id = ?", (new_sentiment, mention_id))
+                            conn.commit()
+                        
+                        updated_count += 1
+                        logger.debug(f"✅ Updated sentiment for {mention_id}: {new_sentiment}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error re-evaluating sentiment for {mention_id}: {e}")
+                    continue
+            
+            # Small delay between batches to be respectful to the API
+            time.sleep(2)
+        
+        logger.info(f"✅ Sentiment re-evaluation completed: {updated_count} mentions updated")
+        
+        return jsonify({
+            "message": f"Successfully re-evaluated sentiment for {updated_count} mentions",
+            "total_processed": len(mentions),
+            "updated": updated_count
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ Error during sentiment re-evaluation: {e}")
+        return jsonify({"error": f"Re-evaluation failed: {str(e)}"}), 500
+
 # HTML Template (embedded) - User's Preferred Version
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -1750,6 +2320,7 @@ HTML_TEMPLATE = '''
   <p class="csv-btn">
     <button id="csv-btn" onclick="downloadCurrentBrandCSV()">📥 Download CSV</button>
     <button id="pdf-btn" style="display:none;" onclick="downloadPDF()">📄 Download as PDF</button>
+    <button id="re-evaluate-btn" onclick="reEvaluateSentiment()">🔄 Re-evaluate All Sentiment</button>
   </p>
 
   <div id="mentions-tab">
@@ -1888,6 +2459,40 @@ HTML_TEMPLATE = '''
 
     function downloadCurrentBrandCSV() {
       window.location.href = `/download?brand=${currentBrand}`;
+    }
+
+    function reEvaluateSentiment() {
+      if (!confirm("This will re-analyze sentiment for ALL existing entries using the new Groq model. This may take several minutes. Continue?")) {
+        return;
+      }
+      
+      const button = document.getElementById('re-evaluate-btn');
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = '🔄 Processing...';
+      
+      fetch('/re-evaluate-sentiment', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.error) {
+          alert(`Error: ${data.error}`);
+        } else {
+          alert(`Success! ${data.message}`);
+          loadData(); // Refresh the current view
+        }
+      })
+      .catch(error => {
+        alert(`Error: ${error.message}`);
+      })
+      .finally(() => {
+        button.disabled = false;
+        button.textContent = originalText;
+      });
     }
 
          function loadStats() {
