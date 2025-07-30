@@ -57,8 +57,10 @@ CONFIG = {
         "Lollapalooza", "EDM", "BeyondWonderland", "kandi"
     ],
     'subreddits': [
-        # Fallback subreddits
-        "all", "popular", "announcements"
+        "Rezz", "aves", "ElectricForest", "sewing", "avesfashion",
+        "cyber_fashion", "aveoutfits", "RitaFourEssenceSystem", "SoftDramatics", "Shein",
+        "avesNYC", "veld", "BADINKA", "PlusSize",
+        "LostLandsMusicFest", "festivals", "avefashion", "avesafe", "EDCOrlando"
     ],
     'port': int(os.getenv('PORT', 5000))
 }
