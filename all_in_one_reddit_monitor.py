@@ -58,12 +58,7 @@ CONFIG = {
     ],
     'subreddits': [
         # Fallback subreddits
-        "Rezz", "aves", "ElectricForest", "avesfashion",
-        "cyber_fashion", "aveoutfits", "RitaFourEssenceSystem",
-        "avesNYC", "veld", "BADINKA","LostLandsMusicFest", "festivals", 
-	    "avefashion", "avesafe", "EDCOrlando",
-        "BassCanyon", "Tomorrowland", "Soundhaven", "Shambhala",
-        "Lollapalooza", "EDM", "BeyondWonderland"
+        "all", "popular", "announcements"
     ],
     'port': int(os.getenv('PORT', 5000))
 }
@@ -506,7 +501,7 @@ class RedditMonitor:
             'praw_comments': True,
             'praw_posts': True, 
             'json_api': True,
-            'rss_backup': False
+            'rss_backup': True  # Healthy when in standby mode
         }
         logger.info("🛡️ Resilience systems initialized: error tracking, request queue, RSS backup")
         
@@ -1397,8 +1392,8 @@ class RedditMonitor:
         session = requests.Session()
         session.headers.update({"User-Agent": "BrandMentionMonitor/1.0 by AllInOneRedditMonitor"})
         seen_json_ids = set()
-        chunk_size = 5  # Process subreddits in chunks
-        base_delay = 15
+        chunk_size = 3  # Smaller chunks to reduce rate limiting
+        base_delay = 25  # Longer delay to reduce rate limiting
         
         subreddits = self.config.get('focused_subreddits', [])
         
@@ -1578,7 +1573,7 @@ class RedditMonitor:
         if primary_systems_down and not self.rss_backup.active:
             logger.warning("🚨 Primary systems failing - activating RSS backup!")
             self.rss_backup.activate()
-            self.system_health['rss_backup'] = True
+            # RSS backup health remains True - it's working as designed
     
     def _check_backup_deactivation(self):
         """Check if RSS backup can be deactivated"""
@@ -1591,7 +1586,7 @@ class RedditMonitor:
         if primary_systems_healthy and self.rss_backup.active:
             logger.info("✅ Primary systems recovered - deactivating RSS backup")
             self.rss_backup.deactivate()
-            self.system_health['rss_backup'] = False
+            # RSS backup health remains True - it's healthy in standby mode
 
     def _process_failed_requests(self):
         """Continuously process and retry requests from the failed_request_queue"""
