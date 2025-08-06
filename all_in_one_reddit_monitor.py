@@ -821,7 +821,17 @@ class RedditMonitor:
                     brands = self.find_brands(body)
                     
                     if brands:
+                        # Track that we've processed this comment for all brands
+                        comment_processed = False
+                        
                         for brand in brands:
+                            # Create brand-specific ID for duplicate detection
+                            brand_specific_id = f"{comment_id}_{brand}"
+                            
+                            # Check if this specific brand mention has been processed
+                            if brand_specific_id in self.seen_ids:
+                                continue
+                            
                             mention = Mention(
                                 id=comment_id,
                                 type="comment",
@@ -838,8 +848,11 @@ class RedditMonitor:
                             )
                             
                             self.mention_buffer.append(mention)
-                            self.seen_ids.add(comment_id)
+                            self.seen_ids.add(brand_specific_id)
                             logger.info(f"Found JSON mention: {brand} in r/{comment_data['subreddit']}")
+                            
+                            if not comment_processed:
+                                comment_processed = True
                             
         except Exception as e:
             logger.error(f"JSON processing error: {e}")
@@ -962,7 +975,15 @@ class RedditMonitor:
                     brands = self.find_brands(comment.body)
                     if brands:
                         for brand in brands:
-                            # Analyze sentiment IMMEDIATELY
+                            # Create brand-specific ID for duplicate detection
+                            brand_specific_id = f"{comment.id}_{brand}"
+                            
+                            # Check if this specific brand mention has been processed
+                            if brand_specific_id in self.seen_ids:
+                                logger.info(f"⏭️ Skipped duplicate brand mention: {brand} for comment {comment.id}")
+                                continue
+                            
+                            # Analyze sentiment IMMEDIATELY for this specific brand
                             context_text = comment.body[:400]  # Focus on relevant content
                             try:
                                 sentiment = self.sentiment.analyze(context_text, brand)
@@ -986,22 +1007,10 @@ class RedditMonitor:
                                 source="praw"
                             )
                             
-                            # Check for duplicates using ID, core ID, and content
-                            content_hash = f"{brand}_{str(comment.subreddit)}_{hash(comment.body[:100])}"
-                            
-                            is_duplicate = (comment.id in self.seen_ids or 
-                                          comment.id in self.seen_core_ids or 
-                                          content_hash in self.seen_content)
-                            
-                            if not is_duplicate:
-                                # Save to database IMMEDIATELY
-                                self.db.insert_mentions([mention])
-                                self.seen_ids.add(comment.id)
-                                self.seen_core_ids.add(comment.id)
-                                self.seen_content.add(content_hash)
-                                logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment} (ID: {comment.id})")
-                            else:
-                                logger.info(f"⏭️ Skipped duplicate: ID={comment.id in self.seen_ids}, CoreID={comment.id in self.seen_core_ids}, Content={content_hash in self.seen_content} for brand {brand}")
+                            # Save to database IMMEDIATELY
+                            self.db.insert_mentions([mention])
+                            self.seen_ids.add(brand_specific_id)
+                            logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment} (ID: {comment.id})")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -1106,7 +1115,15 @@ class RedditMonitor:
                     
                     if brands:
                         for brand in brands:
-                            # Analyze sentiment IMMEDIATELY
+                            # Create brand-specific ID for duplicate detection
+                            brand_specific_id = f"{post.id}_{brand}"
+                            
+                            # Check if this specific brand mention has been processed
+                            if brand_specific_id in self.seen_ids:
+                                logger.info(f"⏭️ Skipped duplicate brand mention: {brand} for post {post.id}")
+                                continue
+                            
+                            # Analyze sentiment IMMEDIATELY for this specific brand
                             context_text = full_text[:400]  # Focus on relevant content
                             try:
                                 sentiment = self.sentiment.analyze(context_text, brand)
@@ -1130,22 +1147,10 @@ class RedditMonitor:
                                 source="praw"
                             )
                             
-                            # Check for duplicates using ID, core ID, and content
-                            content_hash = f"{brand}_{str(post.subreddit)}_{hash(full_text[:100])}"
-                            
-                            is_duplicate = (post.id in self.seen_ids or 
-                                          post.id in self.seen_core_ids or 
-                                          content_hash in self.seen_content)
-                            
-                            if not is_duplicate:
-                                # Save to database IMMEDIATELY
-                                self.db.insert_mentions([mention])
-                                self.seen_ids.add(post.id)
-                                self.seen_core_ids.add(post.id)
-                                self.seen_content.add(content_hash)
-                                logger.info(f"✅ Saved PRAW post mention: {brand} in r/{post.subreddit} with sentiment: {sentiment}")
-                            else:
-                                logger.info(f"⏭️ Skipped duplicate post: ID={post.id in self.seen_ids}, CoreID={post.id in self.seen_core_ids}, Content={content_hash in self.seen_content} for brand {brand}")
+                            # Save to database IMMEDIATELY
+                            self.db.insert_mentions([mention])
+                            self.seen_ids.add(brand_specific_id)
+                            logger.info(f"✅ Saved PRAW post mention: {brand} in r/{post.subreddit} with sentiment: {sentiment}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -1621,6 +1626,13 @@ class RedditMonitor:
                     brands = self.find_brands(full_text)
                     if brands:
                         for brand in brands:
+                            # Create brand-specific ID for duplicate detection
+                            brand_specific_id = f"{post_id}_{brand}"
+                            
+                            # Check if this specific brand mention has been processed
+                            if brand_specific_id in self.seen_ids:
+                                continue
+                            
                             mention = Mention(
                                 id=post_id,
                                 type="post",
@@ -1637,7 +1649,7 @@ class RedditMonitor:
                             )
                             
                             self.mention_buffer.append(mention)
-                            self.seen_ids.add(post_id)
+                            self.seen_ids.add(brand_specific_id)
                             logger.info(f"Found focused mention: {brand} in r/{subreddit} (post)")
                             
         except Exception as e:
