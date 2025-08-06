@@ -2174,70 +2174,7 @@ def test_groq():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-@app.route('/reevaluate-sentiment', methods=['POST'])
-def reevaluate_sentiment():
-    """Reevaluate sentiment for a specific mention"""
-    try:
-        data = request.get_json()
-        mention_id = data.get('id')
-        
-        if not mention_id:
-            return jsonify({"error": "No mention ID provided"})
-        
-        # Get the mention from database
-        with db_manager.get_connection() as conn:
-            cursor = conn.execute('''
-                SELECT id, type, title, body, permalink, created, subreddit, author, score, sentiment, brand, source
-                FROM mentions 
-                WHERE id = ?
-            ''', (mention_id,))
-            mention_data = cursor.fetchone()
-            
-            if not mention_data:
-                return jsonify({"error": "Mention not found"})
-            
-            # Create a Mention object for context extraction
-            mention = Mention(
-                id=mention_data[0],
-                type=mention_data[1],
-                title=mention_data[2],
-                body=mention_data[3],
-                permalink=mention_data[4],
-                created=mention_data[5],
-                subreddit=mention_data[6],
-                author=mention_data[7],
-                score=mention_data[8],
-                sentiment=mention_data[9],
-                brand=mention_data[10],
-                source=mention_data[11]
-            )
-            
-            # Extract context and reevaluate sentiment
-            context_text = reddit_monitor._extract_brand_context(mention)
-            if not context_text:
-                context_text = f"{mention.title or ''} {mention.body or ''}"
-            
-            # Analyze sentiment with the improved analyzer
-            new_sentiment = reddit_monitor.sentiment.analyze(context_text, mention.brand)
-            
-            # Update the database
-            conn.execute('''
-                UPDATE mentions 
-                SET sentiment = ? 
-                WHERE id = ?
-            ''', (new_sentiment, mention_id))
-            conn.commit()
-            
-            return jsonify({
-                "status": "success",
-                "old_sentiment": mention.sentiment,
-                "new_sentiment": new_sentiment,
-                "context_used": context_text[:100] + "..." if len(context_text) > 100 else context_text
-            })
-            
-    except Exception as e:
-        logger.error(f"❌ Sentiment reevaluation error: {e}")
-        return jsonify({"error": str(e)})
+
 
 @app.route('/backfill/<subreddit>')
 def backfill_subreddit(subreddit):
@@ -2414,9 +2351,9 @@ HTML_TEMPLATE = '''
     #data-table th:nth-child(3) { width: 12%; } /* Author */
     #data-table th:nth-child(4) { width: 8%; } /* Link */
     #data-table th:nth-child(5) { width: 15%; } /* Created */
-    #data-table th:nth-child(6) { width: 25%; } /* Preview */
+    #data-table th:nth-child(6) { width: 30%; } /* Preview */
     #data-table th:nth-child(7) { width: 10%; } /* Sentiment */
-    #data-table th:nth-child(8) { width: 10%; } /* Action */
+    #data-table th:nth-child(8) { width: 5%; } /* Action */
   </style>
 </head>
 <body>
@@ -2557,10 +2494,7 @@ HTML_TEMPLATE = '''
               <td>${new Date(item.created).toLocaleString()}</td>
               <td>${item.body || item.title || ""}</td>
               <td>${badge}</td>
-              <td>
-                <button onclick="reevaluateSentiment('${item.id}')" style="background-color: #ffc107; margin-right: 5px;">🔄 Reevaluate</button>
-                <button onclick="deleteEntry('${item.id}')">🗑️ Delete</button>
-              </td>`;
+              <td><button onclick="deleteEntry('${item.id}')">🗑️ Delete</button></td>`;
             tbody.appendChild(row);
           });
         });
@@ -2575,38 +2509,7 @@ HTML_TEMPLATE = '''
       }).then(() => loadData());
     }
 
-    function reevaluateSentiment(id) {
-      if (!confirm("Reevaluate sentiment for this entry? This will use the improved Groq API.")) return;
-      
-      // Show loading state
-      const button = event.target;
-      const originalText = button.textContent;
-      button.textContent = "⏳ Processing...";
-      button.disabled = true;
-      
-      fetch("/reevaluate-sentiment", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id })
-      })
-      .then(res => res.json())
-      .then(data => {
-        if (data.status === "success") {
-          alert(`Sentiment updated!\nOld: ${data.old_sentiment}\nNew: ${data.new_sentiment}\n\nContext used: ${data.context_used}`);
-          loadData(); // Refresh the table
-        } else {
-          alert(`Error: ${data.error}`);
-        }
-      })
-      .catch(error => {
-        alert(`Error: ${error.message}`);
-      })
-      .finally(() => {
-        // Restore button state
-        button.textContent = originalText;
-        button.disabled = false;
-      });
-    }
+
 
     function downloadCurrentBrandCSV() {
       window.location.href = `/download?brand=${currentBrand}`;
