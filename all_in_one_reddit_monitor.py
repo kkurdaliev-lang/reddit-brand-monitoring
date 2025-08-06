@@ -396,28 +396,33 @@ class SentimentAnalyzer:
     
     def analyze(self, context_text: str, brand_name: str = "the brand") -> str:
         """Analyze sentiment specifically toward a brand using Groq"""
-        logger.info(f"🔍 Starting Groq brand sentiment analysis for '{brand_name}' in text: '{context_text[:100]}...'")
+        # Clean the text for better analysis
+        cleaned_text = self._clean_text_for_analysis(context_text)
+        
+        logger.info(f"🔍 Starting Groq brand sentiment analysis for '{brand_name}' in text: '{cleaned_text[:100]}...'")
+        logger.info(f"📝 Full context length: {len(cleaned_text)} characters")
+        logger.info(f"📝 Context preview: '{cleaned_text[:200]}...'")
         
         if not self.api_token:
             logger.warning("❌ No Groq API token provided")
             return "neutral"
             
-        if not context_text.strip():
+        if not cleaned_text.strip():
             logger.warning("❌ Empty text provided for sentiment analysis")
             return "neutral"
         
         try:
             # Create brand-focused prompt
-            prompt = f"""Analyze the sentiment specifically about the brand '{brand_name}' in this text:
+            prompt = f"""Analyze the sentiment about the brand '{brand_name}' in this text. Look for mentions of the brand and determine if the sentiment is positive, negative, or neutral.
 
-"{context_text[:500]}"
+Text: "{context_text[:500]}"
 
-Focus ONLY on opinions, experiences, or feelings about this specific brand. Ignore general complaints or negative words that don't relate to the brand itself.
-
-For example:
-- "I ordered from {brand_name} and had zero issues, great quality" = positive (customer satisfied with brand)
-- "Shipping took forever but {brand_name} quality is amazing" = positive (complaint about shipping, not brand)
-- "{brand_name} clothes are overpriced and poor quality" = negative (directly about brand)
+Instructions:
+- Look for direct mentions of '{brand_name}' or related terms
+- If the text mentions the brand positively (good quality, satisfied, recommend, etc.) = positive
+- If the text mentions the brand negatively (bad quality, disappointed, avoid, etc.) = negative  
+- If the text mentions the brand neutrally or doesn't mention it = neutral
+- If you cannot determine sentiment or no brand mention = neutral
 
 Respond with ONLY ONE WORD: positive, negative, or neutral"""
 
@@ -429,12 +434,14 @@ Respond with ONLY ONE WORD: positive, negative, or neutral"""
                         "content": prompt
                     }
                 ],
-                "max_tokens": 10,
-                "temperature": 0.1
+                "max_tokens": 20,
+                "temperature": 0.0
             }
             
             logger.info(f"📡 Sending request to Groq API")
             logger.info(f"🎯 Brand focus: {brand_name}")
+            logger.info(f"🔑 API Token present: {'Yes' if self.api_token else 'No'}")
+            logger.info(f"🔑 API Token length: {len(self.api_token) if self.api_token else 0}")
             
             response = requests.post(self.api_url, headers=self.headers, json=payload, timeout=15)
             logger.info(f"📊 Response status: {response.status_code}")
@@ -444,12 +451,19 @@ Respond with ONLY ONE WORD: positive, negative, or neutral"""
                 sentiment_text = result['choices'][0]['message']['content'].strip().lower()
                 logger.info(f"🤖 Groq response: '{sentiment_text}'")
                 
-                # Clean and validate response
+                # Enhanced response validation
                 if 'positive' in sentiment_text:
                     sentiment = 'positive'
                 elif 'negative' in sentiment_text:
                     sentiment = 'negative'
+                elif 'neutral' in sentiment_text:
+                    sentiment = 'neutral'
+                elif 'unable' in sentiment_text or 'cannot' in sentiment_text or 'error' in sentiment_text:
+                    logger.warning(f"⚠️ Groq model unable to analyze sentiment: '{sentiment_text}'")
+                    # Try with a different model as fallback
+                    return self._try_fallback_model(context_text, brand_name)
                 else:
+                    logger.warning(f"⚠️ Unexpected Groq response format: '{sentiment_text}'")
                     sentiment = 'neutral'
                 
                 logger.info(f"🎯 Final brand sentiment for '{brand_name}': {sentiment}")
@@ -463,6 +477,73 @@ Respond with ONLY ONE WORD: positive, negative, or neutral"""
         
         logger.warning("⚠️ Falling back to neutral sentiment")
         return "neutral"
+    
+    def _clean_text_for_analysis(self, text: str) -> str:
+        """Clean text for better sentiment analysis"""
+        import re
+        
+        # Remove URLs
+        text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+        
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove special characters that might confuse the model
+        text = re.sub(r'[^\w\s\.\,\!\?\-]', '', text)
+        
+        # Limit length to avoid token limits
+        if len(text) > 800:
+            text = text[:800]
+        
+        return text.strip()
+    
+    def _try_fallback_model(self, context_text: str, brand_name: str) -> str:
+        """Try with a different model if the first one fails"""
+        try:
+            logger.info(f"🔄 Trying fallback model for '{brand_name}'")
+            
+            # Clean text for fallback model too
+            cleaned_text = self._clean_text_for_analysis(context_text)
+            
+            # Simpler prompt for fallback
+            fallback_prompt = f"""Is the sentiment about '{brand_name}' in this text positive, negative, or neutral?
+
+Text: "{cleaned_text[:300]}"
+
+Answer with one word: positive, negative, or neutral"""
+
+            fallback_payload = {
+                "model": "mixtral-8x7b-32768",
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": fallback_prompt
+                    }
+                ],
+                "max_tokens": 10,
+                "temperature": 0.0
+            }
+            
+            response = requests.post(self.api_url, headers=self.headers, json=fallback_payload, timeout=15)
+            
+            if response.status_code == 200:
+                result = response.json()
+                sentiment_text = result['choices'][0]['message']['content'].strip().lower()
+                logger.info(f"🤖 Fallback model response: '{sentiment_text}'")
+                
+                if 'positive' in sentiment_text:
+                    return 'positive'
+                elif 'negative' in sentiment_text:
+                    return 'negative'
+                else:
+                    return 'neutral'
+            else:
+                logger.error(f"❌ Fallback model also failed: {response.status_code}")
+                return 'neutral'
+                
+        except Exception as e:
+            logger.error(f"💥 Fallback model error: {e}")
+            return 'neutral'
 
 class RedditMonitor:
     def __init__(self, config: dict, db: DatabaseManager):
@@ -2069,6 +2150,29 @@ def download_csv():
 def test_route():
     """Simple test route to verify Flask routing is working"""
     return jsonify({"status": "success", "message": "Flask routing is working!", "timestamp": datetime.utcnow().isoformat()})
+
+@app.route('/test-groq')
+def test_groq():
+    """Test Groq API functionality"""
+    try:
+        api_token = CONFIG.get('groq_api_token', '')
+        if not api_token:
+            return jsonify({"error": "No GROQ_API_TOKEN configured"})
+        
+        # Test with a simple sentiment analysis
+        sentiment_analyzer = SentimentAnalyzer(api_token)
+        test_text = "I love badinka clothing, it's amazing quality!"
+        result = sentiment_analyzer.analyze(test_text, "badinka")
+        
+        return jsonify({
+            "status": "success",
+            "api_token_present": bool(api_token),
+            "api_token_length": len(api_token),
+            "test_text": test_text,
+            "sentiment_result": result
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 @app.route('/backfill/<subreddit>')
 def backfill_subreddit(subreddit):
