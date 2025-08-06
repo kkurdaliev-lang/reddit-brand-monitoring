@@ -2297,6 +2297,7 @@ HTML_TEMPLATE = '''
             <button onclick="changeWeek(-1)">⬅️ Previous Week</button>
             <span id="week-label-left" style="margin: 0 20px; font-weight: bold;">This Week</span>
             <button onclick="changeWeek(1)">Next Week ➡️</button>
+            <button onclick="goToToday()" style="margin-left: 10px; background-color: #28a745; color: white; border: none; padding: 5px 10px; border-radius: 3px;">Today</button>
           </div>
           <canvas id="bar-left" style="margin-top: 20px; height: 300px;"></canvas>
         </td>
@@ -2305,6 +2306,7 @@ HTML_TEMPLATE = '''
             <button onclick="changeWeek(-1)">⬅️ Previous Week</button>
             <span id="week-label-right" style="margin: 0 20px; font-weight: bold;">This Week</span>
             <button onclick="changeWeek(1)">Next Week ➡️</button>
+            <button onclick="goToToday()" style="margin-left: 10px; background-color: #28a745; color: white; border: none; padding: 5px 10px; border-radius: 3px;">Today</button>
           </div>
           <canvas id="bar-right" style="margin-top: 20px; height: 300px;"></canvas>
         </td>
@@ -2343,6 +2345,11 @@ HTML_TEMPLATE = '''
 
     function changeWeek(offset) {
       weekOffset += offset;
+      loadWeeklyCharts();
+    }
+
+    function goToToday() {
+      weekOffset = 0;
       loadWeeklyCharts();
     }
 
