@@ -1853,7 +1853,10 @@ def debug_info():
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    # Expose brands to the frontend as a JS array
+    brands_list = list(CONFIG['brands'].keys())
+    brands_js = f"<script>window.BRANDS = {brands_list!r};</script>"
+    return render_template_string(brands_js + HTML_TEMPLATE)
 
 @app.route('/health')
 def health():
@@ -2533,8 +2536,10 @@ HTML_TEMPLATE = '''
 
          function loadStats() {
        const tzOffset = new Date().getTimezoneOffset();
-       fetch(`/stats?brand=badinka&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
-       fetch(`/stats?brand=candycatz&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
+       const leftBrand = window.BRANDS[0] || 'badinka';
+       const rightBrand = window.BRANDS[1] || window.BRANDS[0] || 'candy catz';
+       fetch(`/stats?brand=${encodeURIComponent(leftBrand)}&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
+       fetch(`/stats?brand=${encodeURIComponent(rightBrand)}&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
        loadWeeklyCharts();
      }
 
@@ -2577,21 +2582,20 @@ HTML_TEMPLATE = '''
       const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
       const monday = getMonday(weekOffset);
       updateWeekLabel(monday);
-
       const days = Array.from({ length: 7 }, (_, i) => {
         const d = new Date(monday);
         d.setDate(monday.getDate() + i);
         d.setHours(0, 0, 0, 0);
         return d;
       });
-
       const labels = days.map(d => d.toLocaleDateString());
-      const keys = days.map(d => d.toLocaleDateString('en-CA'));  // en-CA = YYYY-MM-DD
-
-             Promise.all([
-         fetch(`/weekly_mentions?brand=badinka&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
-         fetch(`/weekly_mentions?brand=candycatz&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
-       ]).then(([leftData, rightData]) => {
+      const keys = days.map(d => d.toLocaleDateString('en-CA'));
+      const leftBrand = window.BRANDS[0] || 'badinka';
+      const rightBrand = window.BRANDS[1] || window.BRANDS[0] || 'candy catz';
+      Promise.all([
+        fetch(`/weekly_mentions?brand=${encodeURIComponent(leftBrand)}&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
+        fetch(`/weekly_mentions?brand=${encodeURIComponent(rightBrand)}&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
+      ]).then(([leftData, rightData]) => {
         const leftValues = keys.map(key => leftData[key] || 0);
         const rightValues = keys.map(key => rightData[key] || 0);
         const maxY = Math.max(...leftValues, ...rightValues, 1);
@@ -2636,6 +2640,7 @@ HTML_TEMPLATE = '''
     switchBrand(currentBrand);
     setInterval(loadData, 30000);
   </script>
+  <script>if (!window.BRANDS) window.BRANDS = ['badinka', 'candy catz'];</script>
 </body>
 </html>
 '''
