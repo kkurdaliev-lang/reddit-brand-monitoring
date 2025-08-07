@@ -714,6 +714,7 @@ class RedditMonitor:
                 full_text = f"{title} {description}"
                 
                 brands = self.find_brands(full_text)
+                logger.debug(f"Multi-brand detection: found brands {brands} in RSS full_text '{full_text[:120]}...'")
                 if brands:
                     for brand in brands:
                         mention = Mention(
@@ -1114,7 +1115,7 @@ class RedditMonitor:
                     # Check both title and selftext for brand mentions
                     full_text = f"{post.title} {post.selftext}"
                     brands = self.find_brands(full_text)
-                    logger.debug(f"Multi-brand detection: found brands {brands} in post '{full_text[:120]}...'")
+                    logger.debug(f"Multi-brand detection: found brands {brands} in full_text '{full_text[:120]}...'")
                     if brands:
                         for brand in brands:
                             # Create brand-specific ID for duplicate detection
@@ -1368,6 +1369,7 @@ class RedditMonitor:
                             if gap_start <= created_time <= gap_end:
                                 comment_body = comment_data.get('body', '')
                                 brands = self.find_brands(comment_body)
+                                logger.debug(f"Multi-brand detection: found brands {brands} in backfill comment_body '{comment_body[:120]}...'")
                                 
                                 if brands:
                                     comments_found += 1
@@ -1409,6 +1411,7 @@ class RedditMonitor:
                             if gap_start <= created_time <= gap_end:
                                 full_text = f"{post_data.get('title', '')} {post_data.get('selftext', '')}"
                                 brands = self.find_brands(full_text)
+                                logger.debug(f"Multi-brand detection: found brands {brands} in backfill post '{full_text[:120]}...'")
                                 
                                 if brands:
                                     posts_found += 1
@@ -1626,6 +1629,7 @@ class RedditMonitor:
                     full_text = f"{title} {selftext}"
                     
                     brands = self.find_brands(full_text)
+                    logger.debug(f"Multi-brand detection: found brands {brands} in focused subreddit post '{full_text[:120]}...'")
                     if brands:
                         for brand in brands:
                             # Create brand-specific ID for duplicate detection
@@ -1753,7 +1757,7 @@ class RedditMonitor:
                         
                         full_text = f"{post.title} {post.selftext}"
                         brands = self.find_brands(full_text)
-                        logger.debug(f"Multi-brand detection: found brands {brands} in post '{full_text[:120]}...'")
+                        logger.debug(f"Multi-brand detection: found brands {brands} in full_text '{full_text[:120]}...'")
                         if brands:
                             for brand in brands:
                                 logger.info(f"🔄 Retry found: {brand} mention in PRAW posts")
