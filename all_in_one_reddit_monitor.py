@@ -819,6 +819,7 @@ class RedditMonitor:
                     
                     body = comment_data.get('body', '')
                     brands = self.find_brands(body)
+                    logger.debug(f"Multi-brand detection: found brands {brands} in comment '{body[:120]}...'")
                     
                     if brands:
                         # Track that we've processed this comment for all brands
@@ -973,6 +974,7 @@ class RedditMonitor:
                         self._check_backup_deactivation()
                     
                     brands = self.find_brands(comment.body)
+                    logger.debug(f"Multi-brand detection: found brands {brands} in comment '{comment.body[:120]}...'")
                     if brands:
                         for brand in brands:
                             # Create brand-specific ID for duplicate detection
@@ -1112,7 +1114,7 @@ class RedditMonitor:
                     # Check both title and selftext for brand mentions
                     full_text = f"{post.title} {post.selftext}"
                     brands = self.find_brands(full_text)
-                    
+                    logger.debug(f"Multi-brand detection: found brands {brands} in post '{full_text[:120]}...'")
                     if brands:
                         for brand in brands:
                             # Create brand-specific ID for duplicate detection
@@ -1732,6 +1734,7 @@ class RedditMonitor:
                             break
                         
                         brands = self.find_brands(comment.body)
+                        logger.debug(f"Multi-brand detection: found brands {brands} in comment '{comment.body[:120]}...'")
                         if brands:
                             for brand in brands:
                                 # Process the mention
@@ -1750,6 +1753,7 @@ class RedditMonitor:
                         
                         full_text = f"{post.title} {post.selftext}"
                         brands = self.find_brands(full_text)
+                        logger.debug(f"Multi-brand detection: found brands {brands} in post '{full_text[:120]}...'")
                         if brands:
                             for brand in brands:
                                 logger.info(f"🔄 Retry found: {brand} mention in PRAW posts")
