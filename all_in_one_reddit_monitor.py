@@ -40,7 +40,7 @@ CONFIG = {
     'groq_api_token': os.getenv('GROQ_API_TOKEN', ''),
     'brands': {
         'badinka': r'[@#]?badinka(?:\.com)?',
-        'devilwalking': r'[@#]?devil\s*walking(?:\.com)?',  # Matches both "devilwalking" and "devil walking"
+        'candy catz': r'[@#]?candy\s*catz(?:\.com)?',  # Matches both "candycatz" and "candy catz"
         # Add more brands here if needed:
         # 'rave_fashion': r'[@#]?rave\s*fashion',
         # 'festival_outfit': r'[@#]?festival\s*outfit',
@@ -2372,7 +2372,7 @@ HTML_TEMPLATE = '''
   <h1>Reddit Brand Monitoring</h1>
      <div id="brand-buttons">
      <button id="btn-badinka" onclick="switchBrand('badinka')">Badinka</button>
-     <button id="btn-devilwalking" onclick="switchBrand('devilwalking')">Devil Walking</button>
+     <button id="btn-candycatz" onclick="switchBrand('candy catz')">Candy Catz</button>
      <button id="btn-stats" onclick="showStats()">Stats</button>
    </div>
   <p class="csv-btn">
@@ -2443,7 +2443,7 @@ HTML_TEMPLATE = '''
        document.getElementById("mentions-tab").style.display = "block";
        document.getElementById("stats-tab").style.display = "none";
        document.getElementById("btn-badinka").disabled = (brand === "badinka");
-       document.getElementById("btn-devilwalking").disabled = (brand === "devilwalking");
+       document.getElementById("btn-candycatz").disabled = (brand === "candy catz");
        document.getElementById("btn-stats").disabled = false;
        document.getElementById("csv-btn").style.display = 'inline-block';
        document.getElementById("pdf-btn").style.display = 'none';
@@ -2454,7 +2454,7 @@ HTML_TEMPLATE = '''
        document.getElementById("mentions-tab").style.display = "none";
        document.getElementById("stats-tab").style.display = "block";
        document.getElementById("btn-badinka").disabled = false;
-       document.getElementById("btn-devilwalking").disabled = false;
+       document.getElementById("btn-candycatz").disabled = false;
        document.getElementById("btn-stats").disabled = true;
        document.getElementById("csv-btn").style.display = 'none';
        document.getElementById("pdf-btn").style.display = 'inline-block';
@@ -2530,7 +2530,7 @@ HTML_TEMPLATE = '''
          function loadStats() {
        const tzOffset = new Date().getTimezoneOffset();
        fetch(`/stats?brand=badinka&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
-       fetch(`/stats?brand=devilwalking&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
+       fetch(`/stats?brand=candycatz&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
        loadWeeklyCharts();
      }
 
@@ -2586,7 +2586,7 @@ HTML_TEMPLATE = '''
 
              Promise.all([
          fetch(`/weekly_mentions?brand=badinka&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
-         fetch(`/weekly_mentions?brand=devilwalking&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
+         fetch(`/weekly_mentions?brand=candycatz&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
        ]).then(([leftData, rightData]) => {
         const leftValues = keys.map(key => leftData[key] || 0);
         const rightValues = keys.map(key => rightData[key] || 0);
