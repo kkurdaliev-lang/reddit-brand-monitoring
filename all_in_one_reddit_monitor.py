@@ -40,7 +40,7 @@ CONFIG = {
     'groq_api_token': os.getenv('GROQ_API_TOKEN', ''),
     'brands': {
         'badinka': r'[@#]?badinka(?:\.com)?',
-        'devilwalking': r'[@#]?devil\s*walking(?:\.com)?',  # Matches both "devilwalking" and "devil walking"
+        'candy catz': r'[@#]?candy\s*catz(?:\.com)?',  # Matches both "candycatz" and "candy catz"
         # Add more brands here if needed:
         # 'rave_fashion': r'[@#]?rave\s*fashion',
         # 'festival_outfit': r'[@#]?festival\s*outfit',
@@ -396,28 +396,33 @@ class SentimentAnalyzer:
     
     def analyze(self, context_text: str, brand_name: str = "the brand") -> str:
         """Analyze sentiment specifically toward a brand using Groq"""
-        logger.info(f"🔍 Starting Groq brand sentiment analysis for '{brand_name}' in text: '{context_text[:100]}...'")
+        # Clean the text for better analysis
+        cleaned_text = self._clean_text_for_analysis(context_text)
+        
+        logger.info(f"🔍 Starting Groq brand sentiment analysis for '{brand_name}' in text: '{cleaned_text[:100]}...'")
+        logger.info(f"📝 Full context length: {len(cleaned_text)} characters")
+        logger.info(f"📝 Context preview: '{cleaned_text[:200]}...'")
         
         if not self.api_token:
             logger.warning("❌ No Groq API token provided")
             return "neutral"
             
-        if not context_text.strip():
+        if not cleaned_text.strip():
             logger.warning("❌ Empty text provided for sentiment analysis")
             return "neutral"
         
         try:
             # Create brand-focused prompt
-            prompt = f"""Analyze the sentiment specifically about the brand '{brand_name}' in this text:
+            prompt = f"""Analyze the sentiment about the brand '{brand_name}' in this text. Look for mentions of the brand and determine if the sentiment is positive, negative, or neutral.
 
-"{context_text[:500]}"
+Text: "{context_text[:500]}"
 
-Focus ONLY on opinions, experiences, or feelings about this specific brand. Ignore general complaints or negative words that don't relate to the brand itself.
-
-For example:
-- "I ordered from {brand_name} and had zero issues, great quality" = positive (customer satisfied with brand)
-- "Shipping took forever but {brand_name} quality is amazing" = positive (complaint about shipping, not brand)
-- "{brand_name} clothes are overpriced and poor quality" = negative (directly about brand)
+Instructions:
+- Look for direct mentions of '{brand_name}' or related terms
+- If the text mentions the brand positively (good quality, satisfied, recommend, etc.) = positive
+- If the text mentions the brand negatively (bad quality, disappointed, avoid, etc.) = negative  
+- If the text mentions the brand neutrally or doesn't mention it = neutral
+- If you cannot determine sentiment or no brand mention = neutral
 
 Respond with ONLY ONE WORD: positive, negative, or neutral"""
 
@@ -429,12 +434,14 @@ Respond with ONLY ONE WORD: positive, negative, or neutral"""
                         "content": prompt
                     }
                 ],
-                "max_tokens": 10,
-                "temperature": 0.1
+                "max_tokens": 20,
+                "temperature": 0.0
             }
             
             logger.info(f"📡 Sending request to Groq API")
             logger.info(f"🎯 Brand focus: {brand_name}")
+            logger.info(f"🔑 API Token present: {'Yes' if self.api_token else 'No'}")
+            logger.info(f"🔑 API Token length: {len(self.api_token) if self.api_token else 0}")
             
             response = requests.post(self.api_url, headers=self.headers, json=payload, timeout=15)
             logger.info(f"📊 Response status: {response.status_code}")
@@ -444,12 +451,19 @@ Respond with ONLY ONE WORD: positive, negative, or neutral"""
                 sentiment_text = result['choices'][0]['message']['content'].strip().lower()
                 logger.info(f"🤖 Groq response: '{sentiment_text}'")
                 
-                # Clean and validate response
+                # Enhanced response validation
                 if 'positive' in sentiment_text:
                     sentiment = 'positive'
                 elif 'negative' in sentiment_text:
                     sentiment = 'negative'
+                elif 'neutral' in sentiment_text:
+                    sentiment = 'neutral'
+                elif 'unable' in sentiment_text or 'cannot' in sentiment_text or 'error' in sentiment_text:
+                    logger.warning(f"⚠️ Groq model unable to analyze sentiment: '{sentiment_text}'")
+                    # Try with a different model as fallback
+                    return self._try_fallback_model(context_text, brand_name)
                 else:
+                    logger.warning(f"⚠️ Unexpected Groq response format: '{sentiment_text}'")
                     sentiment = 'neutral'
                 
                 logger.info(f"🎯 Final brand sentiment for '{brand_name}': {sentiment}")
@@ -463,6 +477,73 @@ Respond with ONLY ONE WORD: positive, negative, or neutral"""
         
         logger.warning("⚠️ Falling back to neutral sentiment")
         return "neutral"
+    
+    def _clean_text_for_analysis(self, text: str) -> str:
+        """Clean text for better sentiment analysis"""
+        import re
+        
+        # Remove URLs
+        text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+        
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove special characters that might confuse the model
+        text = re.sub(r'[^\w\s\.\,\!\?\-]', '', text)
+        
+        # Limit length to avoid token limits
+        if len(text) > 800:
+            text = text[:800]
+        
+        return text.strip()
+    
+    def _try_fallback_model(self, context_text: str, brand_name: str) -> str:
+        """Try with a different model if the first one fails"""
+        try:
+            logger.info(f"🔄 Trying fallback model for '{brand_name}'")
+            
+            # Clean text for fallback model too
+            cleaned_text = self._clean_text_for_analysis(context_text)
+            
+            # Simpler prompt for fallback
+            fallback_prompt = f"""Is the sentiment about '{brand_name}' in this text positive, negative, or neutral?
+
+Text: "{cleaned_text[:300]}"
+
+Answer with one word: positive, negative, or neutral"""
+
+            fallback_payload = {
+                "model": "mixtral-8x7b-32768",
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": fallback_prompt
+                    }
+                ],
+                "max_tokens": 10,
+                "temperature": 0.0
+            }
+            
+            response = requests.post(self.api_url, headers=self.headers, json=fallback_payload, timeout=15)
+            
+            if response.status_code == 200:
+                result = response.json()
+                sentiment_text = result['choices'][0]['message']['content'].strip().lower()
+                logger.info(f"🤖 Fallback model response: '{sentiment_text}'")
+                
+                if 'positive' in sentiment_text:
+                    return 'positive'
+                elif 'negative' in sentiment_text:
+                    return 'negative'
+                else:
+                    return 'neutral'
+            else:
+                logger.error(f"❌ Fallback model also failed: {response.status_code}")
+                return 'neutral'
+                
+        except Exception as e:
+            logger.error(f"💥 Fallback model error: {e}")
+            return 'neutral'
 
 class RedditMonitor:
     def __init__(self, config: dict, db: DatabaseManager):
@@ -633,6 +714,7 @@ class RedditMonitor:
                 full_text = f"{title} {description}"
                 
                 brands = self.find_brands(full_text)
+                logger.debug(f"Multi-brand detection: found brands {brands} in RSS full_text '{full_text[:120]}...'")
                 if brands:
                     for brand in brands:
                         mention = Mention(
@@ -738,9 +820,20 @@ class RedditMonitor:
                     
                     body = comment_data.get('body', '')
                     brands = self.find_brands(body)
+                    logger.debug(f"Multi-brand detection: found brands {brands} in comment '{body[:120]}...'")
                     
                     if brands:
+                        # Track that we've processed this comment for all brands
+                        comment_processed = False
+                        
                         for brand in brands:
+                            # Create brand-specific ID for duplicate detection
+                            brand_specific_id = f"{comment_id}_{brand}"
+                            
+                            # Check if this specific brand mention has been processed
+                            if brand_specific_id in self.seen_ids:
+                                continue
+                            
                             mention = Mention(
                                 id=comment_id,
                                 type="comment",
@@ -757,8 +850,11 @@ class RedditMonitor:
                             )
                             
                             self.mention_buffer.append(mention)
-                            self.seen_ids.add(comment_id)
+                            self.seen_ids.add(brand_specific_id)
                             logger.info(f"Found JSON mention: {brand} in r/{comment_data['subreddit']}")
+                            
+                            if not comment_processed:
+                                comment_processed = True
                             
         except Exception as e:
             logger.error(f"JSON processing error: {e}")
@@ -879,9 +975,18 @@ class RedditMonitor:
                         self._check_backup_deactivation()
                     
                     brands = self.find_brands(comment.body)
+                    logger.debug(f"Multi-brand detection: found brands {brands} in comment '{comment.body[:120]}...'")
                     if brands:
                         for brand in brands:
-                            # Analyze sentiment IMMEDIATELY
+                            # Create brand-specific ID for duplicate detection
+                            brand_specific_id = f"{comment.id}_{brand}"
+                            
+                            # Check if this specific brand mention has been processed
+                            if brand_specific_id in self.seen_ids:
+                                logger.info(f"⏭️ Skipped duplicate brand mention: {brand} for comment {comment.id}")
+                                continue
+                            
+                            # Analyze sentiment IMMEDIATELY for this specific brand
                             context_text = comment.body[:400]  # Focus on relevant content
                             try:
                                 sentiment = self.sentiment.analyze(context_text, brand)
@@ -905,22 +1010,10 @@ class RedditMonitor:
                                 source="praw"
                             )
                             
-                            # Check for duplicates using ID, core ID, and content
-                            content_hash = f"{brand}_{str(comment.subreddit)}_{hash(comment.body[:100])}"
-                            
-                            is_duplicate = (comment.id in self.seen_ids or 
-                                          comment.id in self.seen_core_ids or 
-                                          content_hash in self.seen_content)
-                            
-                            if not is_duplicate:
-                                # Save to database IMMEDIATELY
-                                self.db.insert_mentions([mention])
-                                self.seen_ids.add(comment.id)
-                                self.seen_core_ids.add(comment.id)
-                                self.seen_content.add(content_hash)
-                                logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment} (ID: {comment.id})")
-                            else:
-                                logger.info(f"⏭️ Skipped duplicate: ID={comment.id in self.seen_ids}, CoreID={comment.id in self.seen_core_ids}, Content={content_hash in self.seen_content} for brand {brand}")
+                            # Save to database IMMEDIATELY
+                            self.db.insert_mentions([mention])
+                            self.seen_ids.add(brand_specific_id)
+                            logger.info(f"✅ Saved PRAW mention: {brand} in r/{comment.subreddit} with sentiment: {sentiment} (ID: {comment.id})")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -1022,10 +1115,18 @@ class RedditMonitor:
                     # Check both title and selftext for brand mentions
                     full_text = f"{post.title} {post.selftext}"
                     brands = self.find_brands(full_text)
-                    
+                    logger.debug(f"Multi-brand detection: found brands {brands} in full_text '{full_text[:120]}...'")
                     if brands:
                         for brand in brands:
-                            # Analyze sentiment IMMEDIATELY
+                            # Create brand-specific ID for duplicate detection
+                            brand_specific_id = f"{post.id}_{brand}"
+                            
+                            # Check if this specific brand mention has been processed
+                            if brand_specific_id in self.seen_ids:
+                                logger.info(f"⏭️ Skipped duplicate brand mention: {brand} for post {post.id}")
+                                continue
+                            
+                            # Analyze sentiment IMMEDIATELY for this specific brand
                             context_text = full_text[:400]  # Focus on relevant content
                             try:
                                 sentiment = self.sentiment.analyze(context_text, brand)
@@ -1049,22 +1150,10 @@ class RedditMonitor:
                                 source="praw"
                             )
                             
-                            # Check for duplicates using ID, core ID, and content
-                            content_hash = f"{brand}_{str(post.subreddit)}_{hash(full_text[:100])}"
-                            
-                            is_duplicate = (post.id in self.seen_ids or 
-                                          post.id in self.seen_core_ids or 
-                                          content_hash in self.seen_content)
-                            
-                            if not is_duplicate:
-                                # Save to database IMMEDIATELY
-                                self.db.insert_mentions([mention])
-                                self.seen_ids.add(post.id)
-                                self.seen_core_ids.add(post.id)
-                                self.seen_content.add(content_hash)
-                                logger.info(f"✅ Saved PRAW post mention: {brand} in r/{post.subreddit} with sentiment: {sentiment}")
-                            else:
-                                logger.info(f"⏭️ Skipped duplicate post: ID={post.id in self.seen_ids}, CoreID={post.id in self.seen_core_ids}, Content={content_hash in self.seen_content} for brand {brand}")
+                            # Save to database IMMEDIATELY
+                            self.db.insert_mentions([mention])
+                            self.seen_ids.add(brand_specific_id)
+                            logger.info(f"✅ Saved PRAW post mention: {brand} in r/{post.subreddit} with sentiment: {sentiment}")
                     
                     # Flush buffer more frequently for immediate processing
                     if len(self.mention_buffer) >= 1:  # Process immediately
@@ -1280,6 +1369,7 @@ class RedditMonitor:
                             if gap_start <= created_time <= gap_end:
                                 comment_body = comment_data.get('body', '')
                                 brands = self.find_brands(comment_body)
+                                logger.debug(f"Multi-brand detection: found brands {brands} in backfill comment_body '{comment_body[:120]}...'")
                                 
                                 if brands:
                                     comments_found += 1
@@ -1321,6 +1411,7 @@ class RedditMonitor:
                             if gap_start <= created_time <= gap_end:
                                 full_text = f"{post_data.get('title', '')} {post_data.get('selftext', '')}"
                                 brands = self.find_brands(full_text)
+                                logger.debug(f"Multi-brand detection: found brands {brands} in backfill post '{full_text[:120]}...'")
                                 
                                 if brands:
                                     posts_found += 1
@@ -1538,8 +1629,16 @@ class RedditMonitor:
                     full_text = f"{title} {selftext}"
                     
                     brands = self.find_brands(full_text)
+                    logger.debug(f"Multi-brand detection: found brands {brands} in focused subreddit post '{full_text[:120]}...'")
                     if brands:
                         for brand in brands:
+                            # Create brand-specific ID for duplicate detection
+                            brand_specific_id = f"{post_id}_{brand}"
+                            
+                            # Check if this specific brand mention has been processed
+                            if brand_specific_id in self.seen_ids:
+                                continue
+                            
                             mention = Mention(
                                 id=post_id,
                                 type="post",
@@ -1556,7 +1655,7 @@ class RedditMonitor:
                             )
                             
                             self.mention_buffer.append(mention)
-                            self.seen_ids.add(post_id)
+                            self.seen_ids.add(brand_specific_id)
                             logger.info(f"Found focused mention: {brand} in r/{subreddit} (post)")
                             
         except Exception as e:
@@ -1639,6 +1738,7 @@ class RedditMonitor:
                             break
                         
                         brands = self.find_brands(comment.body)
+                        logger.debug(f"Multi-brand detection: found brands {brands} in comment '{comment.body[:120]}...'")
                         if brands:
                             for brand in brands:
                                 # Process the mention
@@ -1657,6 +1757,7 @@ class RedditMonitor:
                         
                         full_text = f"{post.title} {post.selftext}"
                         brands = self.find_brands(full_text)
+                        logger.debug(f"Multi-brand detection: found brands {brands} in full_text '{full_text[:120]}...'")
                         if brands:
                             for brand in brands:
                                 logger.info(f"🔄 Retry found: {brand} mention in PRAW posts")
@@ -1756,7 +1857,10 @@ def debug_info():
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    # Expose brands to the frontend as a JS array
+    brands_list = list(CONFIG['brands'].keys())
+    brands_js = f"<script>window.BRANDS = {brands_list!r};</script>"
+    return render_template_string(brands_js + HTML_TEMPLATE)
 
 @app.route('/health')
 def health():
@@ -2070,6 +2174,31 @@ def test_route():
     """Simple test route to verify Flask routing is working"""
     return jsonify({"status": "success", "message": "Flask routing is working!", "timestamp": datetime.utcnow().isoformat()})
 
+@app.route('/test-groq')
+def test_groq():
+    """Test Groq API functionality"""
+    try:
+        api_token = CONFIG.get('groq_api_token', '')
+        if not api_token:
+            return jsonify({"error": "No GROQ_API_TOKEN configured"})
+        
+        # Test with a simple sentiment analysis
+        sentiment_analyzer = SentimentAnalyzer(api_token)
+        test_text = "I love badinka clothing, it's amazing quality!"
+        result = sentiment_analyzer.analyze(test_text, "badinka")
+        
+        return jsonify({
+            "status": "success",
+            "api_token_present": bool(api_token),
+            "api_token_length": len(api_token),
+            "test_text": test_text,
+            "sentiment_result": result
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+
 @app.route('/backfill/<subreddit>')
 def backfill_subreddit(subreddit):
     """Manually backfill recent mentions from a specific subreddit"""
@@ -2254,7 +2383,7 @@ HTML_TEMPLATE = '''
   <h1>Reddit Brand Monitoring</h1>
      <div id="brand-buttons">
      <button id="btn-badinka" onclick="switchBrand('badinka')">Badinka</button>
-     <button id="btn-devilwalking" onclick="switchBrand('devilwalking')">Devil Walking</button>
+     <button id="btn-candycatz" onclick="switchBrand('candy catz')">Candy Catz</button>
      <button id="btn-stats" onclick="showStats()">Stats</button>
    </div>
   <p class="csv-btn">
@@ -2325,7 +2454,7 @@ HTML_TEMPLATE = '''
        document.getElementById("mentions-tab").style.display = "block";
        document.getElementById("stats-tab").style.display = "none";
        document.getElementById("btn-badinka").disabled = (brand === "badinka");
-       document.getElementById("btn-devilwalking").disabled = (brand === "devilwalking");
+       document.getElementById("btn-candycatz").disabled = (brand === "candy catz");
        document.getElementById("btn-stats").disabled = false;
        document.getElementById("csv-btn").style.display = 'inline-block';
        document.getElementById("pdf-btn").style.display = 'none';
@@ -2336,7 +2465,7 @@ HTML_TEMPLATE = '''
        document.getElementById("mentions-tab").style.display = "none";
        document.getElementById("stats-tab").style.display = "block";
        document.getElementById("btn-badinka").disabled = false;
-       document.getElementById("btn-devilwalking").disabled = false;
+       document.getElementById("btn-candycatz").disabled = false;
        document.getElementById("btn-stats").disabled = true;
        document.getElementById("csv-btn").style.display = 'none';
        document.getElementById("pdf-btn").style.display = 'inline-block';
@@ -2403,14 +2532,18 @@ HTML_TEMPLATE = '''
       }).then(() => loadData());
     }
 
+
+
     function downloadCurrentBrandCSV() {
       window.location.href = `/download?brand=${currentBrand}`;
     }
 
          function loadStats() {
        const tzOffset = new Date().getTimezoneOffset();
-       fetch(`/stats?brand=badinka&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
-       fetch(`/stats?brand=devilwalking&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
+       const leftBrand = window.BRANDS[0] || 'badinka';
+       const rightBrand = window.BRANDS[1] || window.BRANDS[0] || 'candy catz';
+       fetch(`/stats?brand=${encodeURIComponent(leftBrand)}&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "left"));
+       fetch(`/stats?brand=${encodeURIComponent(rightBrand)}&tz_offset=${tzOffset}`).then(res => res.json()).then(data => renderStats(data, "right"));
        loadWeeklyCharts();
      }
 
@@ -2453,21 +2586,20 @@ HTML_TEMPLATE = '''
       const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
       const monday = getMonday(weekOffset);
       updateWeekLabel(monday);
-
       const days = Array.from({ length: 7 }, (_, i) => {
         const d = new Date(monday);
         d.setDate(monday.getDate() + i);
         d.setHours(0, 0, 0, 0);
         return d;
       });
-
       const labels = days.map(d => d.toLocaleDateString());
-      const keys = days.map(d => d.toLocaleDateString('en-CA'));  // en-CA = YYYY-MM-DD
-
-             Promise.all([
-         fetch(`/weekly_mentions?brand=badinka&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
-         fetch(`/weekly_mentions?brand=devilwalking&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
-       ]).then(([leftData, rightData]) => {
+      const keys = days.map(d => d.toLocaleDateString('en-CA'));
+      const leftBrand = window.BRANDS[0] || 'badinka';
+      const rightBrand = window.BRANDS[1] || window.BRANDS[0] || 'candy catz';
+      Promise.all([
+        fetch(`/weekly_mentions?brand=${encodeURIComponent(leftBrand)}&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json()),
+        fetch(`/weekly_mentions?brand=${encodeURIComponent(rightBrand)}&tz=${tz}&week_offset=${weekOffset}`).then(res => res.json())
+      ]).then(([leftData, rightData]) => {
         const leftValues = keys.map(key => leftData[key] || 0);
         const rightValues = keys.map(key => rightData[key] || 0);
         const maxY = Math.max(...leftValues, ...rightValues, 1);
@@ -2512,6 +2644,7 @@ HTML_TEMPLATE = '''
     switchBrand(currentBrand);
     setInterval(loadData, 30000);
   </script>
+  <script>if (!window.BRANDS) window.BRANDS = ['badinka', 'candy catz'];</script>
 </body>
 </html>
 '''
