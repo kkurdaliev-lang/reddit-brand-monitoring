@@ -39,13 +39,8 @@ CONFIG = {
     },
     'groq_api_token': os.getenv('GROQ_API_TOKEN', ''),
     'brands': {
-        'badinka': r'[@#]?badinka(?:\.com)?',
-        'candy catz': r'[@#]?candy\s*catz(?:\.com)?',  # Matches both "candycatz" and "candy catz"
         'zonia': r'[@#]?zonia(?:\.com)?',
         'dr axe': r'(?:dr[\s\.]?axe|doctor(?:\s+josh)?\s+axe|josh\s+axe)',
-        # Add more brands here if needed:
-        # 'rave_fashion': r'[@#]?rave\s*fashion',
-        # 'festival_outfit': r'[@#]?festival\s*outfit',
     },
     'monitor_all_reddit': True,  # Monitor all of Reddit, not just specific subreddits
     'focused_subreddits': [
