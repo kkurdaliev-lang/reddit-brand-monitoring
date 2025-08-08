@@ -41,6 +41,8 @@ CONFIG = {
     'brands': {
         'badinka': r'[@#]?badinka(?:\.com)?',
         'candy catz': r'[@#]?candy\s*catz(?:\.com)?',  # Matches both "candycatz" and "candy catz"
+        'zonia': r'[@#]?zonia(?:\.com)?',
+        'dr axe': r'(?:dr[\s\.]?axe|doctor(?:\s+josh)?\s+axe|josh\s+axe)',
         # Add more brands here if needed:
         # 'rave_fashion': r'[@#]?rave\s*fashion',
         # 'festival_outfit': r'[@#]?festival\s*outfit',
@@ -48,13 +50,8 @@ CONFIG = {
     'monitor_all_reddit': True,  # Monitor all of Reddit, not just specific subreddits
     'focused_subreddits': [
         # High-priority subreddits for extra coverage
-        "Rezz", "aves", "ElectricForest", "sewing", "avesfashion",
-        "cyber_fashion", "aveoutfits", "RitaFourEssenceSystem", "SoftDramatics", "Shein",
-        "avesNYC", "veld", "BADINKA", "PlusSize",
-        "LostLandsMusicFest", "festivals", "avefashion", "avesafe", "EDCOrlando",
-        "findfashion", "BassCanyon", "Aerials", "electricdaisycarnival", "bonnaroo",
-        "Tomorrowland", "femalefashion", "Soundhaven", "warpedtour", "Shambhala",
-        "Lollapalooza", "EDM", "BeyondWonderland", "kandi"
+        "Muscle_Fit_Motivation", "TheDonaldTrump2024", "OrbOntheMovements", "iGoalPro", "AITAH", "ImmunocineMX", "Candida", "IsItBullshit", "Gastritis",
+        "SkillLearning", "skeptic", "PlantBasedDiet", "healthdiscussion", "Lyme", "vegan", "CrohnsDisease", "StopEatingSeedOils", "keto"
     ],
     'subreddits': [
         # Fallback subreddits
@@ -2384,6 +2381,8 @@ HTML_TEMPLATE = '''
      <div id="brand-buttons">
      <button id="btn-badinka" onclick="switchBrand('badinka')">Badinka</button>
      <button id="btn-candycatz" onclick="switchBrand('candy catz')">Candy Catz</button>
+     <button id="btn-zonia" onclick="switchBrand('zonia')">Zonia</button>
+     <button id="btn-draxe" onclick="switchBrand('dr axe')">Dr. Axe</button>
      <button id="btn-stats" onclick="showStats()">Stats</button>
    </div>
   <p class="csv-btn">
@@ -2455,6 +2454,8 @@ HTML_TEMPLATE = '''
        document.getElementById("stats-tab").style.display = "none";
        document.getElementById("btn-badinka").disabled = (brand === "badinka");
        document.getElementById("btn-candycatz").disabled = (brand === "candy catz");
+       document.getElementById("btn-zonia").disabled = (brand === "zonia");
+       document.getElementById("btn-draxe").disabled = (brand === "dr axe");
        document.getElementById("btn-stats").disabled = false;
        document.getElementById("csv-btn").style.display = 'inline-block';
        document.getElementById("pdf-btn").style.display = 'none';
@@ -2466,6 +2467,8 @@ HTML_TEMPLATE = '''
        document.getElementById("stats-tab").style.display = "block";
        document.getElementById("btn-badinka").disabled = false;
        document.getElementById("btn-candycatz").disabled = false;
+       document.getElementById("btn-zonia").disabled = false;
+       document.getElementById("btn-draxe").disabled = false;
        document.getElementById("btn-stats").disabled = true;
        document.getElementById("csv-btn").style.display = 'none';
        document.getElementById("pdf-btn").style.display = 'inline-block';
