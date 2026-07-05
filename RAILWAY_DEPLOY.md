@@ -1,132 +1,120 @@
 # 🚀 Railway Deployment Guide
 
-This guide will help you deploy the All-in-One Reddit Brand Monitor to Railway.
+Deploy the Reddit Brand Monitor to Railway. This is a **single service**: the
+Flask backend also serves the dashboard (frontend), so you only deploy one
+thing — there is no separate frontend deployment.
 
 ## 📋 Prerequisites
 
 1. A [Railway](https://railway.app) account
-2. Reddit API credentials
-3. (Optional) HuggingFace API token for sentiment analysis
+2. Reddit API credentials (script app)
+3. (Optional) A [Groq](https://console.groq.com) API key for sentiment analysis
 
-## 🔧 Deployment Steps
+## 🔑 1. Get Reddit API credentials
 
-### 1. Push to GitHub
+1. Log into Reddit, go to https://www.reddit.com/prefs/apps
+2. Click "create another app…"
+3. Type: **script**. Name/description: anything. Redirect URI: `http://localhost:8080`
+4. Copy the **Client ID** (string under the app name) and **Client Secret**
 
-Make sure your code is in a GitHub repository with these files:
-- `all_in_one_reddit_monitor.py` (main application)
-- `requirements.txt` (dependencies)
-- `Procfile` (tells Railway how to run the app)
-- `runtime.txt` (specifies Python version)
-- `railway.toml` (Railway configuration)
+> If you created credentials over a year ago, verify the app still exists on
+> that page — old unused apps keep working, but double-check.
 
-### 2. Connect to Railway
+## 🔑 2. (Optional) Get a Groq API key
 
-1. Go to [Railway](https://railway.app)
-2. Click "Start a New Project"
-3. Select "Deploy from GitHub repo"
-4. Choose your repository
+1. Go to https://console.groq.com/keys
+2. Create an API key (free tier is enough — sentiment is only run on actual
+   brand mentions, which are rare)
 
-### 3. Set Environment Variables
+## 🚂 3. Deploy on Railway
 
-In the Railway dashboard, go to your project → Variables tab and add:
+1. Push this repository to GitHub (main branch)
+2. In Railway: **New Project → Deploy from GitHub repo** → select this repo
+3. Railway auto-detects Python, installs `requirements.txt`, and runs the
+   `Procfile` (`web: python all_in_one_reddit_monitor.py`)
 
-**Required:**
+## 💾 4. Add a persistent volume (IMPORTANT)
+
+Without a volume the SQLite database is wiped on every redeploy.
+
+1. In your Railway project, right-click the service → **Attach Volume**
+   (or service → Settings → Volumes)
+2. Mount path: `/app/data`
+
+The app stores its database at `/app/data/reddit_monitor.db` by default
+(override with the `DATABASE_PATH` variable if needed).
+
+## ⚙️ 5. Set environment variables
+
+Service → **Variables** tab:
+
+Required:
 ```
 REDDIT_CLIENT_ID=your_reddit_client_id
 REDDIT_CLIENT_SECRET=your_reddit_client_secret
 ```
 
-**Optional (for sentiment analysis):**
+Optional:
 ```
-HF_API_TOKEN=your_huggingface_token
+GROQ_API_TOKEN=your_groq_api_key      # enables sentiment analysis
+REDDIT_USER_AGENT=python:brand-mention-monitor:v3.0 (by /u/YOUR_REDDIT_USERNAME)
 ```
 
-**The PORT variable is automatically set by Railway - don't add it manually.**
+Do **not** set `PORT` — Railway sets it automatically.
 
-### 4. Get Reddit API Credentials
+Setting `REDDIT_USER_AGENT` with your real Reddit username is recommended:
+Reddit's API rules ask for an identifying user agent.
 
-1. Go to https://www.reddit.com/prefs/apps
-2. Click "Create App" or "Create Another App"
-3. Choose "script" type
-4. Enter any name and description
-5. Copy the Client ID (under the app name) and Client Secret
+## 🌐 6. Expose the app
 
-### 5. Deploy
+Service → Settings → **Networking → Generate Domain**. Visit the URL — the
+dashboard should load. Health check: `https://<your-domain>/health`
+(Railway also polls this automatically, configured in `railway.toml`).
 
-1. Railway will automatically detect this as a Python project
-2. It will install dependencies from `requirements.txt`
-3. It will run the app using the `Procfile`
-4. The deployment typically takes 2-3 minutes
+## ✅ 7. Verify it's working
 
-### 6. Access Your App
+- `/health` → `"monitoring": true`
+- `/system-health` → live worker status: comments/posts streamed counters
+  should climb within a minute or two, `threads_alive` all true
+- `/test-groq` → checks the sentiment API (if configured)
+- Railway logs → look for `🎯 comment stream connected (r/all)` and the
+  periodic `💓 Heartbeat` lines
 
-1. Once deployed, Railway will provide a public URL
-2. Visit `https://your-app-name.railway.app`
-3. You should see the Reddit Brand Monitor dashboard
+## 🧠 How coverage works (why mentions aren't missed)
 
-## 🔍 Troubleshooting
-
-### Build Errors
-
-If Railway shows build errors:
-
-1. **"Could not determine how to build"**: Make sure you have `requirements.txt` and `Procfile` in your repository root
-2. **Python version issues**: Check that `runtime.txt` specifies a supported Python version (3.8-3.11)
-3. **Dependency errors**: Verify all packages in `requirements.txt` are correctly spelled
-
-### Runtime Errors
-
-1. **App won't start**: Check the logs in Railway dashboard for error messages
-2. **No Reddit data**: Verify your Reddit API credentials are correctly set in environment variables
-3. **Database errors**: The app creates its own SQLite database - no additional setup needed
-
-### Health Check
-
-Railway will check `/health` endpoint to ensure the app is running properly. You can also visit this endpoint manually:
-`https://your-app-name.railway.app/health`
-
-## 🎯 What You Get
-
-After successful deployment:
-
-- **Live Reddit monitoring** running 24/7
-- **Web dashboard** accessible from anywhere
-- **Automatic data collection** from multiple sources
-- **SQLite database** that persists between deployments
-- **Export functionality** for CSV downloads
-
-## 💡 Tips
-
-1. **Monitor logs**: Use Railway's log viewer to monitor your app's performance
-2. **Environment variables**: Never commit API keys to your repository - always use Railway's environment variables
-3. **Database**: The SQLite database will persist between deployments in Railway's volume storage
-4. **Custom domain**: Railway allows you to add a custom domain in the project settings
+1. Streams `r/all` comments **and** posts in real time via the official API
+2. Reddit IDs are sequential, so any ID the stream skips (rate limits,
+   restarts, errors, subreddits excluded from r/all) is detected as a gap
+   and fetched explicitly via `/api/info` in batches of 100
+3. The last processed IDs persist in the database, so downtime is backfilled
+   on restart (up to ~1 hour of all-of-Reddit comments by default; tune with
+   `GAP_LIMIT_COMMENTS` / `GAP_LIMIT_POSTS`)
+4. Every 30 minutes a Reddit search sweep per brand catches any post that
+   still slipped through (`SWEEP_INTERVAL_SECONDS` to tune)
 
 ## 🔧 Customization
 
-To modify the brands or subreddits being monitored, edit the `CONFIG` section in `all_in_one_reddit_monitor.py`:
+Edit `CONFIG` in `all_in_one_reddit_monitor.py`:
 
 ```python
 'brands': {
-    'your_brand': r'[@#]?your_brand(?:\.com)?',
-    'competitor': r'[@#]?competitor(?:\.com)?',
+    'badinka': r'(?<![a-z0-9])[@#]?badinka(?:\.com)?',
+    'candy catz': r'(?<![a-z0-9])[@#]?candy\s*catz(?:\.com)?',
 },
-'subreddits': [
-    "your_target_subreddit",
-    "another_community",
-    # add more subreddits
-]
+'search_terms': {
+    'badinka': ['badinka'],
+    'candy catz': ['"candy catz"', 'candycatz'],
+},
 ```
 
-Then push the changes to GitHub and Railway will automatically redeploy.
+Push to GitHub and Railway redeploys automatically.
 
-## 🆘 Support
+## 🆘 Troubleshooting
 
-If you encounter issues:
-
-1. Check Railway's deployment logs
-2. Verify environment variables are set correctly
-3. Test Reddit API credentials using the `/health` endpoint
-4. Ensure your repository has all required files
-
-Your Reddit Brand Monitor should now be live and collecting mentions 24/7! 🎉
+- **401 in logs** → wrong/revoked Reddit credentials; recreate the script app
+- **`database is locked`** → shouldn't happen anymore (WAL mode), but check
+  that only one instance/replica of the service is running
+- **No mentions appearing** → mentions of niche brands are genuinely rare;
+  check `/system-health` counters are climbing, and try
+  `/backfill/<subreddit>` to scan a specific subreddit on demand
+- **Data lost after redeploy** → the volume isn't attached at `/app/data`
